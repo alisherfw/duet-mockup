@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Duet Mock / Duet RRF — G-code HoloViewer (Fixed)</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg:#0b0f14; --panel:rgba(255,255,255,.06); --stroke:rgba(255,255,255,.12); --text:#e8edf2; --muted:#9fb0c3; --neon1:#00f5ff; --neon2:#7c4dff }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:
+      radial-gradient(1200px 1200px at 10% 10%, rgba(124,77,255,.18), transparent 50%),
+      radial-gradient(900px 900px at 85% 30%, rgba(0,245,255,.12), transparent 55%),
+      var(--bg);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+    .wrap{display:grid;grid-template-columns:360px 1fr;grid-template-rows:72px 1fr;gap:16px;height:100%;padding:16px}
+    header{grid-column:1/3;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border:1px solid var(--stroke);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03));border-radius:16px;backdrop-filter:blur(8px)}
+    .brand{display:flex;align-items:center;gap:14px}
+    .logo{width:40px;height:40px;border-radius:10px;background:conic-gradient(from 130deg,var(--neon1),var(--neon2));box-shadow:0 0 24px rgba(124,77,255,.45)}
+    .title{font-family:Orbitron,Inter;letter-spacing:.5px;font-weight:700}
+    .right{display:flex;align-items:center;gap:12px}
+    .btn{appearance:none;border:none;padding:10px 14px;border-radius:12px;color:#071018;background:linear-gradient(135deg,var(--neon1),var(--neon2));font-weight:700;cursor:pointer;box-shadow:0 6px 20px rgba(0,245,255,.18)}
+    .btn.ghost{background:transparent;color:var(--text);border:1px solid var(--stroke);box-shadow:none}
+    .panel{border:1px solid var(--stroke);background:var(--panel);border-radius:16px;backdrop-filter:blur(8px)}
+    .side{display:flex;flex-direction:column;gap:16px}
+    .section{padding:14px 14px 12px}
+    .section h3{margin:0 0 10px 0;font-size:13px;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .k{font-size:12px;color:var(--muted)}
+    .v{font-weight:700}
+    #gcodeCanvas{width:100%;height:100%;display:block}
+    .viewer{position:relative}
+    .overlay{position:absolute;left:10px;top:10px;font-size:12px;color:var(--muted)}
+    .log{padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;overflow:auto;max-height:220px}
+    .pill{padding:4px 8px;border-radius:999px;border:1px solid var(--stroke);color:var(--muted);font-size:12px}
+    input[type=file]{display:none} label[for=file]{cursor:pointer}
+    .progress{height:10px;border-radius:8px;border:1px solid var(--stroke);background:rgba(255,255,255,.06);overflow:hidden}
+    .bar{height:100%;width:0%;background:linear-gradient(90deg,var(--neon1),var(--neon2));box-shadow:0 0 12px rgba(0,245,255,.45) inset}
+    .controls{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .ctl{display:flex;flex-direction:column;gap:6px}
+    .ctl label{font-size:12px;color:var(--muted)}
+    .switch{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+    @media (max-width:980px){.wrap{grid-template-columns:1fr;grid-template-rows:72px 240px 1fr}.viewer{grid-row:2}.side{grid-row:3}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="panel">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <div class="title">Duet Mock / Duet RRF — G-code HoloViewer</div>
+          <div style="font-size:12px;color:var(--muted)">Smooth Path2D render • Multi-tool head markers • Upload & start</div>
+        </div>
+      </div>
+      <div><img src="http://conception.co.kr/layouts/KSOTheme_Starter/src/img/logo-light.svg" alt="Logo" style="width: 100px;" /></div>
+      <div class="right">
+        <span class="pill" id="apiBasePill">API: …</span>
+        <span class="pill" id="apiModePill">mode: auto</span>
+        <input id="file" type="file" accept=".gcode,.gco,.gc" />
+        <label class="btn ghost" for="file">Upload .gcode</label>
+        <button class="btn" id="reloadBtn">Reload</button>
+      </div>
+    </header>
+
+    <div class="panel side">
+      <div class="section">
+        <h3>Machine</h3>
+        <div class="grid">
+          <div><div class="k">State</div><div class="v" id="state">-</div></div>
+          <div><div class="k">Uptime</div><div class="v" id="uptime">-</div></div>
+          <div><div class="k">Job</div><div class="v" id="job">-</div></div>
+          <div><div class="k">Progress</div><div class="v" id="prog">0%</div></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>View Controls</h3>
+        <div class="controls">
+          <div class="ctl">
+            <label>Mode</label>
+            <div class="switch"><input id="singleLayer" type="checkbox" checked /> Single-layer focus</div>
+            <div class="switch"><input id="heatmap" type="checkbox" /> Color by height</div>
+            <div class="switch"><input id="showTravel" type="checkbox" /> Show travel</div>
+            <div class="switch"><input id="showHeads" type="checkbox" checked /> Show head(s)</div>
+            <div class="switch"><input id="onlyPrinted" type="checkbox" checked /> Only show printed layers</div>
+            <div class="switch"><input id="followPrint" type="checkbox" checked /> Follow current layer</div>
+            <div class="switch"><input id="autoScan" type="checkbox" /> Auto-scan layers</div>
+          </div>
+          <div class="ctl">
+            <label>Layer (Z)</label>
+            <input type="range" id="zSlider" min="0" max="1" step="0.001" value="0" />
+            <div class="k">Z: <span class="v" id="zNow">—</span> / <span id="zSpan">—</span> (window <span id="zWin">0.25</span>mm)</div>
+            <input type="range" id="zWindow" min="0.05" max="1.00" step="0.05" value="0.25" />
+            <div class="k">Scan speed: <span class="v" id="scanV">0.25</span>×</div>
+            <input type="range" id="scanSpeed" min="0.05" max="2.0" step="0.05" value="0.25" />
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Progress</h3>
+        <div class="progress"><div class="bar" id="bar"></div></div>
+      </div>
+
+      <div class="section">
+        <h3>Logs</h3>
+        <div class="panel log" id="log" style="height:200px"></div>
+      </div>
+
+      <div class="section" style="padding-bottom:18px">
+        <h3>Quick Tips</h3>
+        <div style="font-size:12px;color:var(--muted)">
+          • Auto-detects Mock vs Duet RRF. Change <b>API_BASE</b> below.<br>
+          • Cached Path2D geometry → fast strokes. Use Single-layer for clarity.<br>
+          • Serve via <code>python -m http.server 5500</code>.
+        </div>
+      </div>
+    </div>
+
+    <div class="panel viewer">
+      <canvas id="gcodeCanvas"></canvas>
+      <div class="overlay" id="overlay">—</div>
+    </div>
+  </div>
+
+  <script>
+    /* ===== CONFIG ===== */
+    const API_BASE = 'http://127.0.0.1:3001';
+    let API_MODE = 'auto'; // 'auto' | 'mock' | 'duet'
+
+    /* ===== Normalized API adapters ===== */
+    const PATHS = {
+      mock: {
+        status: () => fetch(API_BASE + '/machine/status', { cache: 'no-store' }).then(r => r.json()),
+        download: (name) => fetch(API_BASE + '/machine/file/download?name=' + encodeURIComponent(name.replace(/^\/+/, '')), { cache: 'no-store' }).then(r => r.text()),
+        upload: (file, dest) => { const fd = new FormData(); fd.append('file', file); return fetch(API_BASE + '/machine/file/upload', { method: 'POST', body: fd }); },
+        start: (path) => fetch(API_BASE + '/machine/job/start?file=' + encodeURIComponent(path), { method: 'POST' }),
+        normalize: (j) => ({
+          state: { status: j?.state?.status || j?.state || 'unknown' },
+          system: { uptime: j?.system?.uptime ?? 0 },
+          job: { file: j?.job?.file || null, progress: j?.job?.progress || { completion: 0 } },
+          heads: (Array.isArray(j?.coords?.xyz)) ? [{ x: j.coords.xyz[0], y: j.coords.xyz[1], z: j.coords.xyz[2], name: 'H0' }] : []
+        })
+      },
+      duet: {
+        status: () => fetch(API_BASE + '/rr_status?type=3', { cache: 'no-store' }).then(r => r.json()),
+        download: (name) => fetch(API_BASE + '/rr_download?name=' + encodeURIComponent(name.startsWith('/gcodes/') ? name : '/gcodes/' + name), { cache: 'no-store' }).then(r => r.text()),
+        upload: (file, dest) => fetch(API_BASE + '/rr_upload?name=' + encodeURIComponent('/gcodes/' + dest), { method: 'POST', body: file, headers: { 'Content-Type': 'application/octet-stream' } }),
+        start: (path) => fetch(API_BASE + '/rr_gcode?gcode=' + encodeURIComponent('M32 "' + path + '"')),
+        normalize: (j) => {
+          const map = { P: 'printing', I: 'idle', S: 'stopped', M: 'paused', R: 'busy' };
+          const st = (typeof j?.status === 'string') ? (map[j.status] || j.status) : 'unknown';
+          let fn = null;
+          if (j?.job?.file?.fileName) fn = j.job.file.fileName;
+          else if (j?.job?.file?.name) fn = j.job.file.name;
+          else if (j?.fileName) fn = j.fileName;
+          let comp = 0;
+          if (j?.job?.progress?.completion != null) comp = j.job.progress.completion;
+          else if (j?.fractionPrinted != null) comp = j.fractionPrinted;
+          else if (j?.job?.filePosition != null && j?.job?.fileSize) comp = j.job.filePosition / j.job.fileSize;
+          const heads = [];
+          if (Array.isArray(j?.coords?.xyz)) heads.push({ x: j.coords.xyz[0], y: j.coords.xyz[1], z: j.coords.xyz[2], name: (typeof j?.currentTool === 'number') ? ('T' + j.currentTool) : 'Tool' });
+          return { state: { status: st }, system: { uptime: j?.time ?? 0 }, job: { file: fn ? { fileName: fn } : null, progress: { completion: comp || 0 } }, heads };
+        }
+      }
+    };
+
+    /* ===== Runtime state ===== */
+    let parsed = null, canvas, ctx, dims = { w: 0, h: 0 };
+    let ui = {}; let lastCompletion = 0; let lastJobPath = null; let api = PATHS.mock;
+    let cached = null; // geometry cache
+    let scanRAF = null;
+    let followZ = null;
+
+    /* ===== Helpers ===== */
+    const el = id => document.getElementById(id);
+    function log(m) { const L = el('log'); const line = `[${new Date().toLocaleTimeString()}] ${m}`; L.textContent = line + "\n" + L.textContent; console.log(m); }
+    function setText(id, v) { el(id).textContent = v; }
+    function setBar(p) { el('bar').style.width = (Math.max(0, Math.min(1, p)) * 100).toFixed(1) + '%'; }
+    function hslToHex(h, s, l) { s /= 100; l /= 100; const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l), f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1))); return '#' + [f(0), f(8), f(4)].map(x => Math.round(255 * x).toString(16).padStart(2, '0')).join(''); }
+    function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+    async function detectApiMode() {
+      if (API_MODE !== 'auto') return API_MODE;
+      try { const r = await fetch(API_BASE + '/machine/status', { cache: 'no-store' }); if (r.ok) { API_MODE = 'mock'; api = PATHS.mock; return API_MODE; } } catch { }
+      try { const r = await fetch(API_BASE + '/rr_status?type=3', { cache: 'no-store' }); if (r.ok) { API_MODE = 'duet'; api = PATHS.duet; return API_MODE; } } catch { }
+      API_MODE = 'mock'; api = PATHS.mock; return API_MODE;
+    }
+
+    /* ===== Parser with fixes: G0/G1 + G2/G3 + layer comment fallback ===== */
+    function parseGcodeText(txt) {
+      let posAbs = true, eAbs = true;
+      let x = null, y = null, z = 0, e = 0;
+
+      let currentLayer = null, layerHeight = null;
+
+      const segments = [];
+
+      const PUSH = (x1,y1,z1,x2,y2,z2,extrude) => {
+        // Require previous position to exist and a move to occur
+        if (x1==null || y1==null) return;
+        if (x1===x2 && y1===y2 && z1===z2) return;
+        segments.push({ x1,y1,z1,x2,y2,z2,extrude });
+      };
+
+      const lines = txt.split(/\r?\n/);
+      for (const raw of lines) {
+        // Track Cura layer comments for fallback Z
+        if (/^;LAYER:(\d+)/i.test(raw)) {
+          const m = raw.match(/^;LAYER:(\d+)/i);
+          if (m) currentLayer = parseInt(m[1],10);
+        }
+        if (/^;Layer height:\s*([\d.]+)/i.test(raw)) {
+          const m = raw.match(/^;Layer height:\s*([\d.]+)/i);
+          if (m) layerHeight = parseFloat(m[1]);
+        }
+
+        const line = raw.split(';')[0].trim();
+        if (!line) continue;
+
+        if (/^G90\b/i.test(line)) { posAbs = true; continue; }
+        if (/^G91\b/i.test(line)) { posAbs = false; continue; }
+        if (/^M82\b/i.test(line)) { eAbs = true; continue; }
+        if (/^M83\b/i.test(line)) { eAbs = false; continue; }
+
+        if (/^G92\b/i.test(line)) {
+          const mE = /E(-?\d+(?:\.\d+)?)/i.exec(line);
+          if (mE) e = parseFloat(mE[1]);
+          continue;
+        }
+
+        // --- G2/G3 arcs (approximate with short G1s) ---
+        if (/^G2\b|^G3\b/i.test(line)) {
+          // parameters
+          const cw = /^G2\b/i.test(line);
+          const mX = /X(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mY = /Y(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mZ = /Z(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mI = /I(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mJ = /J(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mR = /R(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mE = /E(-?\d+(?:\.\d+)?)/i.exec(line);
+
+          let nx = x, ny = y, nz = z, ne = e;
+          if (mX) nx = (x===null || posAbs) ? parseFloat(mX[1]) : x + parseFloat(mX[1]);
+          if (mY) ny = (y===null || posAbs) ? parseFloat(mY[1]) : y + parseFloat(mY[1]);
+          if (mZ) nz = posAbs ? parseFloat(mZ[1]) : z + parseFloat(mZ[1]);
+          if (mE) ne = eAbs ? parseFloat(mE[1]) : e + parseFloat(mE[1]);
+
+          // Fallback Z from layer comments if no Z on command
+          if (!mZ && layerHeight != null && currentLayer != null) {
+            nz = currentLayer * layerHeight;
+          }
+
+          if (x==null || y==null || nx==null || ny==null) { x=nx??x; y=ny??y; z=nz; e=ne; continue; }
+
+          // Center-based (I,J) preferred. If R given, approximate with simple midpoint circle.
+          let cx, cy, r, ang0, ang1;
+          if (mI || mJ) {
+            const I = mI ? parseFloat(mI[1]) : 0;
+            const J = mJ ? parseFloat(mJ[1]) : 0;
+            cx = (posAbs ? 0 : x) + I + (posAbs ? x : 0);
+            cy = (posAbs ? 0 : y) + J + (posAbs ? y : 0);
+            r = Math.hypot(x - cx, y - cy);
+            ang0 = Math.atan2(y - cy, x - cx);
+            ang1 = Math.atan2(ny - cy, nx - cx);
+          } else if (mR) {
+            // Compute a circle passing through start and end with radius R
+            r = Math.abs(parseFloat(mR[1]));
+            const mx = (x + nx) / 2, my = (y + ny) / 2;
+            const dx = nx - x, dy = ny - y;
+            const q = Math.hypot(dx, dy);
+            if (q === 0) { x=nx; y=ny; z=nz; e=ne; continue; }
+            const h = Math.sqrt(Math.max(0, r*r - (q*q)/4));
+            // two centers; pick cw/ccw accordingly
+            const ux = -dy / q, uy = dx / q;
+            const cxa = mx + ux * h, cya = my + uy * h;
+            const cxb = mx - ux * h, cyb = my - uy * h;
+            // choose center that yields the requested direction
+            function sweepSign(cx,cy){ const a0=Math.atan2(y-cy,x-cx), a1=Math.atan2(ny-cy,nx-cx); let d=a1-a0; d = ((d+Math.PI*2)%(Math.PI*2)); return d>Math.PI?d-2*Math.PI:d; }
+            const sA = sweepSign(cxa,cya), sB = sweepSign(cxb,cyb);
+            if ((cw && sA<0) || (!cw && sA>0)) { cx=cxa; cy=cya; ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx); }
+            else { cx=cxb; cy=cyb; ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx); }
+          } else {
+            // No geometry → fall back to straight line
+            const de = mE ? (ne - e) : 0;
+            const extrude = mE ? (de > 0) : false;
+            PUSH(x,y,z,nx,ny,nz,extrude);
+            x=nx; y=ny; z=nz; e=ne; continue;
+          }
+
+          // Normalize sweep direction
+          let dAng = ang1 - ang0;
+          if (cw && dAng > 0) dAng -= Math.PI*2;
+          if (!cw && dAng < 0) dAng += Math.PI*2;
+
+          // segments count based on sweep
+          const segs = Math.max(8, Math.min(64, Math.ceil(Math.abs(dAng) / (Math.PI/16))));
+          const de = mE ? (ne - e) : 0;
+          const extrude = mE ? (de > 0) : false;
+
+          for (let i=1;i<=segs;i++){
+            const t = i/segs;
+            const ang = ang0 + dAng * t;
+            const px = x + 0; const py = y + 0; const pz = z + (nz - z)*t; // linear Z
+            const qx = cx + r * Math.cos(ang);
+            const qy = cy + r * Math.sin(ang);
+            const qz = z + (nz - z)*t;
+            if (i===1) PUSH(x,y,z,qx,qy,qz,extrude);
+            else PUSH(cx + r*Math.cos(ang0 + dAng*(t-1/segs)), cy + r*Math.sin(ang0 + dAng*(t-1/segs)), z + (nz - z)*(t-1/segs), qx,qy,qz,extrude);
+          }
+
+          x = nx; y = ny; z = nz; e = ne;
+          continue;
+        }
+
+        // --- G0/G1 ---
+        if (/^G0?1\b/i.test(line)) {
+          const mX = /X(-?\d+(?:\.\d+)?)/i.exec(line), mY = /Y(-?\d+(?:\.\d+)?)/i.exec(line),
+                mZ = /Z(-?\d+(?:\.\d+)?)/i.exec(line), mE = /E(-?\d+(?:\.\d+)?)/i.exec(line);
+          let nx = x, ny = y, nz = z, ne = e;
+          if (mX) nx = (x === null || posAbs) ? parseFloat(mX[1]) : x + parseFloat(mX[1]);
+          if (mY) ny = (y === null || posAbs) ? parseFloat(mY[1]) : y + parseFloat(mY[1]);
+          if (mZ) nz = posAbs ? parseFloat(mZ[1]) : z + parseFloat(mZ[1]);
+          if (mE) ne = eAbs ? parseFloat(mE[1]) : e + parseFloat(mE[1]);
+
+          // Fallback Z from layer comments if not present
+          if (!mZ && layerHeight != null && currentLayer != null) {
+            nz = currentLayer * layerHeight;
+          }
+
+          if (x === null || y === null) { x = nx ?? x; y = ny ?? y; z = nz; e = ne; continue; }
+
+          const moved = (nx !== null && ny !== null && (nx !== x || ny !== y || nz !== z));
+          const de = mE ? (ne - e) : 0;
+          // FIX: keep all positive E (no threshold that hides tiny real extrusions)
+          const extrude = mE ? (de > 0) : false;
+
+          if (moved) PUSH(x,y,z, nx ?? x, ny ?? y, nz, extrude);
+          x = nx ?? x; y = ny ?? y; z = nz; e = ne; continue;
+        }
+      }
+
+      // Compute bbox & z range
+      let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      for (const s of segments) {
+        minX = Math.min(minX, s.x1, s.x2); minY = Math.min(minY, s.y1, s.y2); minZ = Math.min(minZ, s.z1, s.z2);
+        maxX = Math.max(maxX, s.x1, s.x2); maxY = Math.max(maxY, s.y1, s.y2); maxZ = Math.max(maxZ, s.z1, s.z2);
+      }
+      if (!isFinite(minX)) { minX = 0; minY = 0; minZ = 0; maxX = 10; maxY = 10; maxZ = 1; }
+
+      return { segments, bbox: { minX, minY, minZ, maxX, maxY, maxZ }, zMin: minZ, zMax: maxZ };
+    }
+
+    /* ===== Geometry cache (bins by MID-Z) ===== */
+    function rebuildCache() {
+      if (!parsed || !ctx) return;
+      const { segments, bbox, zMin, zMax } = parsed;
+      const w = dims.w, h = dims.h, m = 24;
+      const bx = bbox.maxX - bbox.minX, by = bbox.maxY - bbox.minY;
+      const s = Math.min((w - 2 * m) / (bx || 1), (h - 2 * m) / (by || 1));
+      const ox = m + (w - 2 * m - bx * s) / 2, oy = m + (h - 2 * m - by * s) / 2;
+      const toXY = (X, Y) => ({ x: ox + (X - bbox.minX) * s, y: h - (oy + (Y - bbox.minY) * s) });
+
+      const BIN = 64, bins = Array.from({ length: BIN }, () => new Path2D());
+      const binLow = new Array(BIN), binHigh = new Array(BIN), binCount = new Array(BIN).fill(0);
+      const travels = new Path2D();
+      const endpoints = []; // world space
+
+      for (let i = 0; i < BIN; i++) {
+        const low = zMin + i * (zMax - zMin) / BIN;
+        const high = zMin + (i + 1) * (zMax - zMin) / BIN;
+        binLow[i] = low; binHigh[i] = high;
+      }
+
+      for (const seg of segments) {
+        const a = toXY(seg.x1, seg.y1), b = toXY(seg.x2, seg.y2);
+        // FIX: bin by mid-Z so per-layer grouping is stable
+        const zMid = (seg.z1 + seg.z2) / 2;
+        const t = (zMid - zMin) / (zMax - zMin || 1);
+        const bi = Math.min(BIN - 1, Math.max(0, Math.floor(t * BIN)));
+
+        if (seg.extrude) {
+          bins[bi].moveTo(a.x, a.y); bins[bi].lineTo(b.x, b.y);
+          endpoints.push({ x: seg.x2, y: seg.y2, z: seg.z2, bin: bi });
+          binCount[bi]++;
+        } else {
+          travels.moveTo(a.x, a.y); travels.lineTo(b.x, b.y);
+        }
+      }
+
+      cached = { bins, travels, endpoints, zMin, zMax, bbox, ox, oy, scale: s, margin: m, toXY, binLow, binHigh, binCount };
+    }
+
+    /* ===== Render ===== */
+    function drawGrid() {
+      const w = dims.w, h = dims.h;
+      ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      for (let i = 0; i < w; i += 40) { ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke(); }
+      for (let j = 0; j < h; j += 40) { ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(w, j); ctx.stroke(); }
+      ctx.restore();
+    }
+    const HEAD_COLORS = ['#00f5ff', '#ff5cf0', '#ffe04d', '#9cff66'];
+    function drawHeadsWorld(worldHeads) {
+      worldHeads.forEach((h, i) => {
+        const p = cached.toXY(h.x, h.y); const c = HEAD_COLORS[i % HEAD_COLORS.length];
+        ctx.shadowBlur = 10; ctx.shadowColor = c + '99'; ctx.fillStyle = c; ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.shadowBlur = 0; ctx.strokeStyle = c + '66'; ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2); ctx.stroke();
+      });
+    }
+
+    function nearestPrintedBinOrBelow(targetBin) {
+      for (let i = targetBin; i >= 0; i--) { if (cached.binCount[i] > 0) return i; }
+      return -1;
+    }
+
+    function draw(status) {
+      if (!ctx) return;
+      const w = dims.w, h = dims.h;
+      ctx.clearRect(0, 0, w, h); drawGrid();
+      if (!parsed || !cached) return;
+
+      const single = ui.singleLayer.checked, heat = ui.heatmap.checked, showT = ui.showTravel.checked, showH = ui.showHeads.checked, onlyPrinted = ui.onlyPrinted.checked;
+
+      const zMin = cached.zMin, zMax = cached.zMax;
+      const zWin = parseFloat(ui.zWindow.value || '0.25'), zFrac = parseFloat(ui.zSlider.value || '0');
+      let zC = zMin + (zMax - zMin) * zFrac;
+
+      // printed boundary from progress
+      let zPrintedHi = zC;
+      if (onlyPrinted && cached.endpoints.length) {
+        const idx = Math.min(cached.endpoints.length - 1, Math.floor(cached.endpoints.length * (lastCompletion || 0)));
+        zPrintedHi = cached.endpoints[idx].z;
+      }
+
+      const binH = (zMax - zMin) / cached.bins.length;
+      let targetBin = Math.max(0, Math.min(cached.bins.length - 1, Math.floor((zC - zMin) / (binH || 1))));
+      if (single && onlyPrinted) {
+        const printedBin = Math.max(0, Math.min(cached.bins.length - 1, Math.floor((zPrintedHi - zMin) / (binH || 1))));
+        targetBin = Math.min(targetBin, printedBin);
+        const snap = nearestPrintedBinOrBelow(targetBin);
+        if (snap >= 0) {
+          const low = cached.binLow[snap], high = cached.binHigh[snap];
+          zC = (low + high) / 2;
+        }
+      }
+
+      setText('zNow', zC.toFixed(3)); setText('zSpan', `${zMin.toFixed(3)}–${zMax.toFixed(3)}`); setText('zWin', zWin.toFixed(2));
+      if (showT) { ctx.lineWidth = 1.1; ctx.strokeStyle = 'rgba(180,190,210,0.28)'; ctx.stroke(cached.travels); }
+
+      const zLo = zC - zWin / 2, zHi = zC + zWin / 2;
+      ctx.lineWidth = 2.0;
+
+      const drawBin = (i, color) => { ctx.strokeStyle = color; ctx.stroke(cached.bins[i]); };
+
+      if (heat) {
+        for (let i = 0; i < cached.bins.length; i++) {
+          const low = cached.binLow[i], high = cached.binHigh[i];
+          if (single && (high < zLo || low > zHi)) continue;
+          if (onlyPrinted && high > zPrintedHi + 1e-6) continue;
+          const t = ((low + high) / 2 - zMin) / (zMax - zMin || 1);
+          drawBin(i, hslToHex(200 + 140 * t, 100, 60));
+        }
+      } else {
+        const grad = ctx.createLinearGradient(0, 0, w, h); grad.addColorStop(0, '#00f5ff'); grad.addColorStop(1, '#7c4dff');
+        for (let i = 0; i < cached.bins.length; i++) {
+          const low = cached.binLow[i], high = cached.binHigh[i];
+          if (single && (high < zLo || low > zHi)) continue;
+          if (onlyPrinted && high > zPrintedHi + 1e-6) continue;
+          drawBin(i, grad);
+        }
+      }
+
+      if (showH) {
+        if (status.heads && status.heads.length) {
+          drawHeadsWorld(status.heads);
+        } else if (cached.endpoints.length) {
+          const idx = Math.min(cached.endpoints.length - 1, Math.floor(cached.endpoints.length * (lastCompletion || 0)));
+          drawHeadsWorld([cached.endpoints[idx]]);
+        }
+      }
+
+      el('overlay').textContent = `${cached.endpoints.length} segments • ${(lastCompletion * 100 || 0).toFixed(1)}% ${single ? `• Z≈${zC.toFixed(2)}mm` : ''}`;
+    }
+
+    /* ===== Data / polling ===== */
+    async function getNormalizedStatus() { const mode = await detectApiMode(); el('apiModePill').textContent = 'mode: ' + mode; return api.status().then(api.normalize); }
+    async function poll() {
+      try {
+        const st = await getNormalizedStatus();
+        setText('state', st?.state?.status || '—'); setText('uptime', (st?.system?.uptime ?? 0) + 's');
+        lastCompletion = st?.job?.progress?.completion ?? 0; setBar(lastCompletion); setText('prog', ((lastCompletion * 100) || 0).toFixed(1) + '%');
+
+        if (ui.followPrint.checked && cached) {
+          let targetFrac = null;
+          if (cached.endpoints && cached.endpoints.length) {
+            const idx = Math.min(cached.endpoints.length - 1, Math.floor(cached.endpoints.length * (lastCompletion || 0)));
+            const zNow = cached.endpoints[idx].z;
+            targetFrac = (zNow - cached.zMin) / (cached.zMax - cached.zMin || 1);
+          } else if (st.heads && st.heads[0] && Number.isFinite(st.heads[0].z)) {
+            const zNow = st.heads[0].z;
+            targetFrac = (zNow - cached.zMin) / (cached.zMax - cached.zMin || 1);
+          }
+          if (targetFrac != null && isFinite(targetFrac)) {
+            followZ = (followZ == null) ? targetFrac : (followZ * 0.85 + targetFrac * 0.15);
+            ui.zSlider.value = clamp01(followZ);
+          }
+        }
+
+        const filePath = st?.job?.file?.fileName || null; setText('job', filePath || '—');
+        if (filePath && filePath !== lastJobPath) {
+          const name = filePath.replace(/^\/+/, '');
+          log('Job file: ' + name + ' — fetching…');
+          const txt = await api.download(name.startsWith('gcodes/') ? name : ('gcodes/' + name));
+          parsed = parseGcodeText(txt); lastJobPath = filePath; rebuildCache();
+          log(`G-code loaded: ${parsed.segments.length} segments`); draw(st);
+        } else { draw(st); }
+      } catch (e) { log('poll error: ' + e.message); }
+      finally { setTimeout(poll, 1000); }
+    }
+
+    /* ===== Upload / start ===== */
+    async function uploadAndStart(file) {
+      const dest = file.name || 'upload.gcode';
+      try {
+        await detectApiMode();
+        const r = await api.upload(file, dest); if (!r.ok) throw new Error('upload failed ' + r.status);
+        const serverFile = '/gcodes/' + dest; log('Uploaded: ' + serverFile);
+        const s = await api.start(serverFile); if (!s.ok) throw new Error('start failed ' + s.status);
+        log('Start command sent: ' + serverFile);
+      } catch (err) { log('upload/start error: ' + err.message + ' (starting from Duet Web Control is also fine)'); }
+    }
+
+    /* ===== Auto-scan (layer sweep) ===== */
+    function startScan() {
+      stopScan(); const speed = parseFloat(ui.scanSpeed.value || '0.25'); const step = speed / 2000;
+      function tick() {
+        if (!ui.autoScan.checked) { scanRAF = null; return; }
+        let v = parseFloat(ui.zSlider.value); v += step; if (v > 1) v = 0; ui.zSlider.value = v; draw({ heads: [] }); scanRAF = requestAnimationFrame(tick);
+      }
+      scanRAF = requestAnimationFrame(tick);
+    }
+    function stopScan() { if (scanRAF) { cancelAnimationFrame(scanRAF); scanRAF = null; } }
+
+    /* ===== Bootstrap ===== */
+    function resize() {
+      const c = el('gcodeCanvas'), r = c.parentElement.getBoundingClientRect();
+      const w = Math.floor(r.width), h = Math.floor(r.height); if (w === dims.w && h === dims.h) return;
+      dims = { w, h }; c.width = w * devicePixelRatio; c.height = h * devicePixelRatio; c.style.width = w + 'px'; c.style.height = h + 'px';
+      ctx = c.getContext('2d'); ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); if (parsed) rebuildCache(); draw({ heads: [] });
+    }
+    function init() {
+      ui = {
+        singleLayer: el('singleLayer'), heatmap: el('heatmap'), showTravel: el('showTravel'),
+        showHeads: el('showHeads'), zSlider: el('zSlider'), zWindow: el('zWindow'),
+        autoScan: el('autoScan'), scanSpeed: el('scanSpeed'), followPrint: el('followPrint'),
+        onlyPrinted: el('onlyPrinted')
+      };
+      el('apiBasePill').textContent = 'API: ' + API_BASE;
+      el('scanV').textContent = ui.scanSpeed.value;
+
+      ui.zSlider.disabled = ui.followPrint.checked;
+
+      el('file').addEventListener('change', e => { const f = e.target.files[0]; if (f) uploadAndStart(f); });
+      el('reloadBtn').addEventListener('click', () => { lastJobPath = null; });
+      window.addEventListener('resize', resize);
+
+      ['change', 'input'].forEach(ev => {
+        ui.singleLayer.addEventListener(ev, () => draw({ heads: [] })); ui.heatmap.addEventListener(ev, () => draw({ heads: [] }));
+        ui.showTravel.addEventListener(ev, () => draw({ heads: [] })); ui.showHeads.addEventListener(ev, () => draw({ heads: [] }));
+        ui.onlyPrinted.addEventListener(ev, () => draw({ heads: [] }));
+        ui.zSlider.addEventListener(ev, () => { followZ = null; draw({ heads: [] }); });
+        ui.zWindow.addEventListener(ev, () => draw({ heads: [] }));
+        ui.scanSpeed.addEventListener(ev, () => { el('scanV').textContent = ui.scanSpeed.value; if (ui.autoScan.checked) { startScan(); } });
+        ui.autoScan.addEventListener('change', () => {
+          if (ui.autoScan.checked) {
+            ui.followPrint.checked = false; ui.onlyPrinted.checked = false; ui.zSlider.disabled = false; startScan();
+          } else { stopScan(); }
+          draw({ heads: [] });
+        });
+        ui.followPrint.addEventListener(ev, () => {
+          ui.zSlider.disabled = ui.followPrint.checked;
+          if (ui.followPrint.checked) { ui.autoScan.checked = false; stopScan(); }
+          followZ = null; draw({ heads: [] });
+        });
+      });
+
+      canvas = el('gcodeCanvas'); ctx = canvas.getContext('2d'); resize(); poll();
+    }
+    init();
+  </script>
+</body>
+</html>
