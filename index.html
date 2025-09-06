@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Duet Mock / Duet RRF — G-code HoloViewer (Fixed)</title>
+  <title>Duet Mock / Duet RRF — G-code HoloViewer (Cura-style motion)</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
   <style>
     :root { --bg:#0b0f14; --panel:rgba(255,255,255,.06); --stroke:rgba(255,255,255,.12); --text:#e8edf2; --muted:#9fb0c3; --neon1:#00f5ff; --neon2:#7c4dff }
@@ -49,7 +49,7 @@
         <div class="logo"></div>
         <div>
           <div class="title">Duet Mock / Duet RRF — G-code HoloViewer</div>
-          <div style="font-size:12px;color:var(--muted)">Smooth Path2D render • Multi-tool head markers • Upload & start</div>
+          <div style="font-size:12px;color:var(--muted)">Smooth Path2D render • Live/Preview motion • Upload & start</div>
         </div>
       </div>
       <div><img src="http://conception.co.kr/layouts/KSOTheme_Starter/src/img/logo-light.svg" alt="Logo" style="width: 100px;" /></div>
@@ -111,7 +111,7 @@
         <h3>Quick Tips</h3>
         <div style="font-size:12px;color:var(--muted)">
           • Auto-detects Mock vs Duet RRF. Change <b>API_BASE</b> below.<br>
-          • Cached Path2D geometry → fast strokes. Use Single-layer for clarity.<br>
+          • Cura-style motion: local timeline + Duet sync.<br>
           • Serve via <code>python -m http.server 5500</code>.
         </div>
       </div>
@@ -139,7 +139,8 @@
           state: { status: j?.state?.status || j?.state || 'unknown' },
           system: { uptime: j?.system?.uptime ?? 0 },
           job: { file: j?.job?.file || null, progress: j?.job?.progress || { completion: 0 } },
-          heads: (Array.isArray(j?.coords?.xyz)) ? [{ x: j.coords.xyz[0], y: j.coords.xyz[1], z: j.coords.xyz[2], name: 'H0' }] : []
+          // coords.xyz may exist; we ignore and drive from timeline for smoothness
+          heads: []
         })
       },
       duet: {
@@ -154,13 +155,13 @@
           if (j?.job?.file?.fileName) fn = j.job.file.fileName;
           else if (j?.job?.file?.name) fn = j.job.file.name;
           else if (j?.fileName) fn = j.fileName;
+
           let comp = 0;
           if (j?.job?.progress?.completion != null) comp = j.job.progress.completion;
           else if (j?.fractionPrinted != null) comp = j.fractionPrinted;
           else if (j?.job?.filePosition != null && j?.job?.fileSize) comp = j.job.filePosition / j.job.fileSize;
-          const heads = [];
-          if (Array.isArray(j?.coords?.xyz)) heads.push({ x: j.coords.xyz[0], y: j.coords.xyz[1], z: j.coords.xyz[2], name: (typeof j?.currentTool === 'number') ? ('T' + j.currentTool) : 'Tool' });
-          return { state: { status: st }, system: { uptime: j?.time ?? 0 }, job: { file: fn ? { fileName: fn } : null, progress: { completion: comp || 0 } }, heads };
+
+          return { state: { status: st }, system: { uptime: j?.time ?? 0 }, job: { file: fn ? { fileName: fn } : null, progress: { completion: comp || 0 } }, heads: [] };
         }
       }
     };
@@ -168,7 +169,7 @@
     /* ===== Runtime state ===== */
     let parsed = null, canvas, ctx, dims = { w: 0, h: 0 };
     let ui = {}; let lastCompletion = 0; let lastJobPath = null; let api = PATHS.mock;
-    let cached = null; // geometry cache
+    let cached = null; // geometry cache (bins, travels, endpoints)
     let scanRAF = null;
     let followZ = null;
 
@@ -177,179 +178,133 @@
     function log(m) { const L = el('log'); const line = `[${new Date().toLocaleTimeString()}] ${m}`; L.textContent = line + "\n" + L.textContent; console.log(m); }
     function setText(id, v) { el(id).textContent = v; }
     function setBar(p) { el('bar').style.width = (Math.max(0, Math.min(1, p)) * 100).toFixed(1) + '%'; }
-    function hslToHex(h, s, l) { s /= 100; l /= 100; const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l), f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1))); return '#' + [f(0), f(8), f(4)].map(x => Math.round(255 * x).toString(16).padStart(2, '0')).join(''); }
-    function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+    function hslToHex(h, s, l) { s/=100; l/=100; const k=n=>(n+h/30)%12,a=s*Math.min(l,1-l),f=n=>l-a*Math.max(-1,Math.min(k(n)-3,Math.min(9-k(n),1))); return '#'+[f(0),f(8),f(4)].map(x=>Math.round(255*x).toString(16).padStart(2,'0')).join(''); }
+    function clamp01(x){return Math.max(0,Math.min(1,x));}
+    function lowerBound(arr, x, get=(v)=>v){ let lo=0, hi=arr.length; while(lo<hi){ const mid=(lo+hi>>>1); if(get(arr[mid])<x) lo=mid+1; else hi=mid; } return lo; }
 
     async function detectApiMode() {
       if (API_MODE !== 'auto') return API_MODE;
-      try { const r = await fetch(API_BASE + '/machine/status', { cache: 'no-store' }); if (r.ok) { API_MODE = 'mock'; api = PATHS.mock; return API_MODE; } } catch { }
-      try { const r = await fetch(API_BASE + '/rr_status?type=3', { cache: 'no-store' }); if (r.ok) { API_MODE = 'duet'; api = PATHS.duet; return API_MODE; } } catch { }
+      try { const r = await fetch(API_BASE + '/machine/status', { cache: 'no-store' }); if (r.ok) { API_MODE = 'mock'; api = PATHS.mock; return API_MODE; } } catch {}
+      try { const r = await fetch(API_BASE + '/rr_status?type=3', { cache: 'no-store' }); if (r.ok) { API_MODE = 'duet'; api = PATHS.duet; return API_MODE; } } catch {}
       API_MODE = 'mock'; api = PATHS.mock; return API_MODE;
     }
 
-    /* ===== Parser with fixes: G0/G1 + G2/G3 + layer comment fallback ===== */
+    /* ===== Parser (G0/G1 + G2/G3) + Cura-comment fallback + Feedrate timeline ===== */
     function parseGcodeText(txt) {
       let posAbs = true, eAbs = true;
-      let x = null, y = null, z = 0, e = 0;
+      let x=null, y=null, z=0, e=0, f=1800; // F in mm/min (default)
+      let currentLayer=null, layerHeight=null;
+      const segments=[];
 
-      let currentLayer = null, layerHeight = null;
-
-      const segments = [];
-
-      const PUSH = (x1,y1,z1,x2,y2,z2,extrude) => {
-        // Require previous position to exist and a move to occur
+      const PUSH = (x1,y1,z1,x2,y2,z2,extrude,feed) => {
         if (x1==null || y1==null) return;
         if (x1===x2 && y1===y2 && z1===z2) return;
-        segments.push({ x1,y1,z1,x2,y2,z2,extrude });
+        segments.push({ x1,y1,z1,x2,y2,z2,extrude,f:feed });
       };
 
       const lines = txt.split(/\r?\n/);
       for (const raw of lines) {
         // Track Cura layer comments for fallback Z
-        if (/^;LAYER:(\d+)/i.test(raw)) {
-          const m = raw.match(/^;LAYER:(\d+)/i);
-          if (m) currentLayer = parseInt(m[1],10);
-        }
-        if (/^;Layer height:\s*([\d.]+)/i.test(raw)) {
-          const m = raw.match(/^;Layer height:\s*([\d.]+)/i);
-          if (m) layerHeight = parseFloat(m[1]);
-        }
+        const mL = raw.match(/^;LAYER:(\d+)/i); if (mL) currentLayer = parseInt(mL[1],10);
+        const mLH = raw.match(/^;Layer height:\s*([\d.]+)/i); if (mLH) layerHeight = parseFloat(mLH[1]);
 
-        const line = raw.split(';')[0].trim();
-        if (!line) continue;
+        const line = raw.split(';')[0].trim(); if (!line) continue;
 
         if (/^G90\b/i.test(line)) { posAbs = true; continue; }
         if (/^G91\b/i.test(line)) { posAbs = false; continue; }
         if (/^M82\b/i.test(line)) { eAbs = true; continue; }
         if (/^M83\b/i.test(line)) { eAbs = false; continue; }
 
-        if (/^G92\b/i.test(line)) {
-          const mE = /E(-?\d+(?:\.\d+)?)/i.exec(line);
-          if (mE) e = parseFloat(mE[1]);
-          continue;
-        }
+        if (/^G92\b/i.test(line)) { const mE=/E(-?\d+(?:\.\d+)?)/i.exec(line); if(mE) e=parseFloat(mE[1]); continue; }
 
-        // --- G2/G3 arcs (approximate with short G1s) ---
+        const mF=/F(-?\d+(?:\.\d+)?)/i.exec(line); if (mF) f = parseFloat(mF[1]);
+
+        // ---- ARCS ----
         if (/^G2\b|^G3\b/i.test(line)) {
-          // parameters
           const cw = /^G2\b/i.test(line);
-          const mX = /X(-?\d+(?:\.\d+)?)/i.exec(line);
-          const mY = /Y(-?\d+(?:\.\d+)?)/i.exec(line);
-          const mZ = /Z(-?\d+(?:\.\d+)?)/i.exec(line);
-          const mI = /I(-?\d+(?:\.\d+)?)/i.exec(line);
-          const mJ = /J(-?\d+(?:\.\d+)?)/i.exec(line);
-          const mR = /R(-?\d+(?:\.\d+)?)/i.exec(line);
-          const mE = /E(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mX=/X(-?\d+(?:\.\d+)?)/i.exec(line), mY=/Y(-?\d+(?:\.\d+)?)/i.exec(line),
+                mZ=/Z(-?\d+(?:\.\d+)?)/i.exec(line), mE=/E(-?\d+(?:\.\d+)?)/i.exec(line),
+                mI=/I(-?\d+(?:\.\d+)?)/i.exec(line), mJ=/J(-?\d+(?:\.\d+)?)/i.exec(line), mR=/R(-?\d+(?:\.\d+)?)/i.exec(line);
 
-          let nx = x, ny = y, nz = z, ne = e;
-          if (mX) nx = (x===null || posAbs) ? parseFloat(mX[1]) : x + parseFloat(mX[1]);
-          if (mY) ny = (y===null || posAbs) ? parseFloat(mY[1]) : y + parseFloat(mY[1]);
-          if (mZ) nz = posAbs ? parseFloat(mZ[1]) : z + parseFloat(mZ[1]);
-          if (mE) ne = eAbs ? parseFloat(mE[1]) : e + parseFloat(mE[1]);
+          let nx=x, ny=y, nz=z, ne=e;
+          if (mX) nx=(x===null||posAbs)?parseFloat(mX[1]):x+parseFloat(mX[1]);
+          if (mY) ny=(y===null||posAbs)?parseFloat(mY[1]):y+parseFloat(mY[1]);
+          if (mZ) nz=posAbs?parseFloat(mZ[1]):z+parseFloat(mZ[1]);
+          if (mE) ne=eAbs?parseFloat(mE[1]):e+parseFloat(mE[1]);
+          if (!mZ && layerHeight!=null && currentLayer!=null) nz=currentLayer*layerHeight;
+          if (x==null||y==null||nx==null||ny==null){ x=nx??x; y=ny??y; z=nz; e=ne; continue; }
 
-          // Fallback Z from layer comments if no Z on command
-          if (!mZ && layerHeight != null && currentLayer != null) {
-            nz = currentLayer * layerHeight;
-          }
-
-          if (x==null || y==null || nx==null || ny==null) { x=nx??x; y=ny??y; z=nz; e=ne; continue; }
-
-          // Center-based (I,J) preferred. If R given, approximate with simple midpoint circle.
-          let cx, cy, r, ang0, ang1;
-          if (mI || mJ) {
-            const I = mI ? parseFloat(mI[1]) : 0;
-            const J = mJ ? parseFloat(mJ[1]) : 0;
-            cx = (posAbs ? 0 : x) + I + (posAbs ? x : 0);
-            cy = (posAbs ? 0 : y) + J + (posAbs ? y : 0);
-            r = Math.hypot(x - cx, y - cy);
-            ang0 = Math.atan2(y - cy, x - cx);
-            ang1 = Math.atan2(ny - cy, nx - cx);
-          } else if (mR) {
-            // Compute a circle passing through start and end with radius R
-            r = Math.abs(parseFloat(mR[1]));
-            const mx = (x + nx) / 2, my = (y + ny) / 2;
-            const dx = nx - x, dy = ny - y;
-            const q = Math.hypot(dx, dy);
-            if (q === 0) { x=nx; y=ny; z=nz; e=ne; continue; }
-            const h = Math.sqrt(Math.max(0, r*r - (q*q)/4));
-            // two centers; pick cw/ccw accordingly
-            const ux = -dy / q, uy = dx / q;
-            const cxa = mx + ux * h, cya = my + uy * h;
-            const cxb = mx - ux * h, cyb = my - uy * h;
-            // choose center that yields the requested direction
-            function sweepSign(cx,cy){ const a0=Math.atan2(y-cy,x-cx), a1=Math.atan2(ny-cy,nx-cx); let d=a1-a0; d = ((d+Math.PI*2)%(Math.PI*2)); return d>Math.PI?d-2*Math.PI:d; }
-            const sA = sweepSign(cxa,cya), sB = sweepSign(cxb,cyb);
-            if ((cw && sA<0) || (!cw && sA>0)) { cx=cxa; cy=cya; ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx); }
-            else { cx=cxb; cy=cyb; ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx); }
+          let cx,cy,r,ang0,ang1;
+          if (mI||mJ){
+            const I=mI?parseFloat(mI[1]):0, J=mJ?parseFloat(mJ[1]):0;
+            cx=(posAbs?x:0)+I; cy=(posAbs?y:0)+J;
+            r=Math.hypot(x-cx,y-cy);
+            ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx);
+          } else if (mR){
+            r=Math.abs(parseFloat(mR[1]));
+            const mx=(x+nx)/2, my=(y+ny)/2, dx=nx-x, dy=ny-y, q=Math.hypot(dx,dy);
+            if(q===0){ x=nx; y=ny; z=nz; e=ne; continue; }
+            const h=Math.sqrt(Math.max(0,r*r-(q*q)/4)), ux=-dy/q, uy=dx/q;
+            const cxa=mx+ux*h, cya=my+uy*h, cxb=mx-ux*h, cyb=my-uy*h;
+            function sweepSign(cx,cy){ const a0=Math.atan2(y-cy,x-cx), a1=Math.atan2(ny-cy,nx-cx); let d=a1-a0; d=((d+Math.PI*2)%(Math.PI*2)); return d>Math.PI?d-2*Math.PI:d; }
+            if ((cw && sweepSign(cxa,cya)<0) || (!cw && sweepSign(cxa,cya)>0)) { cx=cxa; cy=cya; }
+            else { cx=cxb; cy=cyb; }
+            ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx);
           } else {
-            // No geometry → fall back to straight line
-            const de = mE ? (ne - e) : 0;
-            const extrude = mE ? (de > 0) : false;
-            PUSH(x,y,z,nx,ny,nz,extrude);
-            x=nx; y=ny; z=nz; e=ne; continue;
+            const de=mE?(ne-e):0, extr=mE?(de>0):false;
+            PUSH(x,y,z,nx,ny,nz,extr,f); x=nx;y=ny;z=nz;e=ne;continue;
           }
 
-          // Normalize sweep direction
-          let dAng = ang1 - ang0;
-          if (cw && dAng > 0) dAng -= Math.PI*2;
-          if (!cw && dAng < 0) dAng += Math.PI*2;
-
-          // segments count based on sweep
-          const segs = Math.max(8, Math.min(64, Math.ceil(Math.abs(dAng) / (Math.PI/16))));
-          const de = mE ? (ne - e) : 0;
-          const extrude = mE ? (de > 0) : false;
-
+          let dAng=ang1-ang0; if (cw && dAng>0) dAng-=Math.PI*2; if (!cw && dAng<0) dAng+=Math.PI*2;
+          const segs=Math.max(8,Math.min(64,Math.ceil(Math.abs(dAng)/(Math.PI/16))));
+          const de=mE?(ne-e):0, extr=mE?(de>0):false;
+          let px=x, py=y, pz=z;
           for (let i=1;i<=segs;i++){
-            const t = i/segs;
-            const ang = ang0 + dAng * t;
-            const px = x + 0; const py = y + 0; const pz = z + (nz - z)*t; // linear Z
-            const qx = cx + r * Math.cos(ang);
-            const qy = cy + r * Math.sin(ang);
-            const qz = z + (nz - z)*t;
-            if (i===1) PUSH(x,y,z,qx,qy,qz,extrude);
-            else PUSH(cx + r*Math.cos(ang0 + dAng*(t-1/segs)), cy + r*Math.sin(ang0 + dAng*(t-1/segs)), z + (nz - z)*(t-1/segs), qx,qy,qz,extrude);
+            const t=i/segs, ang=ang0+dAng*t;
+            const qx=cx+r*Math.cos(ang), qy=cy+r*Math.sin(ang), qz=z+(nz-z)*t;
+            PUSH(px,py,pz,qx,qy,qz,extr,f);
+            px=qx; py=qy; pz=qz;
           }
-
-          x = nx; y = ny; z = nz; e = ne;
-          continue;
+          x=nx; y=ny; z=nz; e=ne; continue;
         }
 
-        // --- G0/G1 ---
+        // ---- LINES ----
         if (/^G0?1\b/i.test(line)) {
-          const mX = /X(-?\d+(?:\.\d+)?)/i.exec(line), mY = /Y(-?\d+(?:\.\d+)?)/i.exec(line),
-                mZ = /Z(-?\d+(?:\.\d+)?)/i.exec(line), mE = /E(-?\d+(?:\.\d+)?)/i.exec(line);
-          let nx = x, ny = y, nz = z, ne = e;
-          if (mX) nx = (x === null || posAbs) ? parseFloat(mX[1]) : x + parseFloat(mX[1]);
-          if (mY) ny = (y === null || posAbs) ? parseFloat(mY[1]) : y + parseFloat(mY[1]);
-          if (mZ) nz = posAbs ? parseFloat(mZ[1]) : z + parseFloat(mZ[1]);
-          if (mE) ne = eAbs ? parseFloat(mE[1]) : e + parseFloat(mE[1]);
+          const mX=/X(-?\d+(?:\.\d+)?)/i.exec(line), mY=/Y(-?\d+(?:\.\d+)?)/i.exec(line),
+                mZ=/Z(-?\d+(?:\.\d+)?)/i.exec(line), mE=/E(-?\d+(?:\.\d+)?)/i.exec(line);
+          let nx=x, ny=y, nz=z, ne=e;
+          if (mX) nx=(x===null||posAbs)?parseFloat(mX[1]):x+parseFloat(mX[1]);
+          if (mY) ny=(y===null||posAbs)?parseFloat(mY[1]):y+parseFloat(mY[1]);
+          if (mZ) nz=posAbs?parseFloat(mZ[1]):z+parseFloat(mZ[1]);
+          if (mE) ne=eAbs?parseFloat(mE[1]):e+parseFloat(mE[1]);
+          if (!mZ && layerHeight!=null && currentLayer!=null) nz=currentLayer*layerHeight;
 
-          // Fallback Z from layer comments if not present
-          if (!mZ && layerHeight != null && currentLayer != null) {
-            nz = currentLayer * layerHeight;
-          }
-
-          if (x === null || y === null) { x = nx ?? x; y = ny ?? y; z = nz; e = ne; continue; }
-
-          const moved = (nx !== null && ny !== null && (nx !== x || ny !== y || nz !== z));
-          const de = mE ? (ne - e) : 0;
-          // FIX: keep all positive E (no threshold that hides tiny real extrusions)
-          const extrude = mE ? (de > 0) : false;
-
-          if (moved) PUSH(x,y,z, nx ?? x, ny ?? y, nz, extrude);
-          x = nx ?? x; y = ny ?? y; z = nz; e = ne; continue;
+          if (x===null||y===null){ x=nx??x; y=ny??y; z=nz; e=ne; continue; }
+          const moved=(nx!==null&&ny!==null&&(nx!==x||ny!==y||nz!==z));
+          const de=mE?(ne-e):0; const extrude=mE?(de>0):false; // keep ALL positive E
+          if (moved) PUSH(x,y,z,nx??x,ny??y,nz,extrude,f);
+          x=nx??x; y=ny??y; z=nz; e=ne; continue;
         }
       }
 
-      // Compute bbox & z range
-      let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-      for (const s of segments) {
-        minX = Math.min(minX, s.x1, s.x2); minY = Math.min(minY, s.y1, s.y2); minZ = Math.min(minZ, s.z1, s.z2);
-        maxX = Math.max(maxX, s.x1, s.x2); maxY = Math.max(maxY, s.y1, s.y2); maxZ = Math.max(maxZ, s.z1, s.z2);
-      }
-      if (!isFinite(minX)) { minX = 0; minY = 0; minZ = 0; maxX = 10; maxY = 10; maxZ = 1; }
+      // BBox
+      let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+      for (const s of segments){ minX=Math.min(minX,s.x1,s.x2); minY=Math.min(minY,s.y1,s.y2); minZ=Math.min(minZ,s.z1,s.z2);
+                                 maxX=Math.max(maxX,s.x1,s.x2); maxY=Math.max(maxY,s.y1,s.y2); maxZ=Math.max(maxZ,s.z1,s.z2); }
+      if(!isFinite(minX)){ minX=0;minY=0;minZ=0;maxX=10;maxY=10;maxZ=1; }
 
-      return { segments, bbox: { minX, minY, minZ, maxX, maxY, maxZ }, zMin: minZ, zMax: maxZ };
+      // Build timeline (Cura-style)
+      let t=0; const times=[]; // end times
+      for (const s of segments){
+        const v=(s.f>0?s.f:1800)/60; // mm/s
+        const L=Math.hypot(s.x2-s.x1,s.y2-s.y1,s.z2-s.z1);
+        s.dt = v>0 ? L/v : 0;
+        s.t0 = t; t += s.dt; s.t1 = t;
+        times.push(s.t1);
+      }
+      const totalTime = t;
+
+      return { segments, times, totalTime, bbox:{minX,minY,minZ,maxX,maxY,maxZ}, zMin:minZ, zMax:maxZ };
     }
 
     /* ===== Geometry cache (bins by MID-Z) ===== */
@@ -358,231 +313,212 @@
       const { segments, bbox, zMin, zMax } = parsed;
       const w = dims.w, h = dims.h, m = 24;
       const bx = bbox.maxX - bbox.minX, by = bbox.maxY - bbox.minY;
-      const s = Math.min((w - 2 * m) / (bx || 1), (h - 2 * m) / (by || 1));
-      const ox = m + (w - 2 * m - bx * s) / 2, oy = m + (h - 2 * m - by * s) / 2;
-      const toXY = (X, Y) => ({ x: ox + (X - bbox.minX) * s, y: h - (oy + (Y - bbox.minY) * s) });
+      const s = Math.min((w - 2*m)/(bx||1), (h - 2*m)/(by||1));
+      const ox = m + (w - 2*m - bx*s)/2, oy = m + (h - 2*m - by*s)/2;
+      const toXY = (X,Y) => ({ x: ox + (X - bbox.minX)*s, y: h - (oy + (Y - bbox.minY)*s) });
 
-      const BIN = 64, bins = Array.from({ length: BIN }, () => new Path2D());
+      const BIN = 64, bins = Array.from({length:BIN}, ()=>new Path2D());
       const binLow = new Array(BIN), binHigh = new Array(BIN), binCount = new Array(BIN).fill(0);
       const travels = new Path2D();
-      const endpoints = []; // world space
+      const endpoints = []; // extruding endpoints in world coords
 
-      for (let i = 0; i < BIN; i++) {
-        const low = zMin + i * (zMax - zMin) / BIN;
-        const high = zMin + (i + 1) * (zMax - zMin) / BIN;
-        binLow[i] = low; binHigh[i] = high;
+      for (let i=0;i<BIN;i++){ const low=zMin+i*(zMax-zMin)/BIN, high=zMin+(i+1)*(zMax-zMin)/BIN; binLow[i]=low; binHigh[i]=high; }
+
+      for (const seg of segments){
+        const a=toXY(seg.x1,seg.y1), b=toXY(seg.x2,seg.y2);
+        const zMid=(seg.z1+seg.z2)/2; const t=(zMid - zMin)/(zMax - zMin || 1);
+        const bi=Math.min(BIN-1,Math.max(0,Math.floor(t*BIN)));
+        if (seg.extrude){ bins[bi].moveTo(a.x,a.y); bins[bi].lineTo(b.x,b.y); endpoints.push({x:seg.x2,y:seg.y2,z:seg.z2,bin:bi}); binCount[bi]++; }
+        else { travels.moveTo(a.x,a.y); travels.lineTo(b.x,b.y); }
       }
 
-      for (const seg of segments) {
-        const a = toXY(seg.x1, seg.y1), b = toXY(seg.x2, seg.y2);
-        // FIX: bin by mid-Z so per-layer grouping is stable
-        const zMid = (seg.z1 + seg.z2) / 2;
-        const t = (zMid - zMin) / (zMax - zMin || 1);
-        const bi = Math.min(BIN - 1, Math.max(0, Math.floor(t * BIN)));
+      cached = { bins, travels, endpoints, zMin, zMax, bbox, ox, oy, scale:s, margin:m, toXY, binLow, binHigh, binCount };
+    }
 
-        if (seg.extrude) {
-          bins[bi].moveTo(a.x, a.y); bins[bi].lineTo(b.x, b.y);
-          endpoints.push({ x: seg.x2, y: seg.y2, z: seg.z2, bin: bi });
-          binCount[bi]++;
-        } else {
-          travels.moveTo(a.x, a.y); travels.lineTo(b.x, b.y);
-        }
-      }
-
-      cached = { bins, travels, endpoints, zMin, zMax, bbox, ox, oy, scale: s, margin: m, toXY, binLow, binHigh, binCount };
+    /* ===== Sampling along the timeline ===== */
+    function positionAtTime(t){
+      if (!parsed || !parsed.segments.length) return null;
+      const times = parsed.times;
+      const i = lowerBound(times, t);
+      const idx = Math.min(Math.max(i, 0), parsed.segments.length - 1);
+      const s = parsed.segments[idx];
+      const u = (s.dt>0) ? Math.min(1, Math.max(0, (t - s.t0) / s.dt)) : 1;
+      return { x: s.x1 + (s.x2 - s.x1)*u, y: s.y1 + (s.y2 - s.y1)*u, z: s.z1 + (s.z2 - s.z1)*u };
+    }
+    function positionAtCompletion(frac){
+      if (!parsed) return null;
+      const t = clamp01(frac) * (parsed.totalTime || 0);
+      return positionAtTime(t);
     }
 
     /* ===== Render ===== */
     function drawGrid() {
       const w = dims.w, h = dims.h;
       ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-      for (let i = 0; i < w; i += 40) { ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke(); }
-      for (let j = 0; j < h; j += 40) { ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(w, j); ctx.stroke(); }
+      for (let i=0;i<w;i+=40){ ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,h); ctx.stroke(); }
+      for (let j=0;j<h;j+=40){ ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(w,j); ctx.stroke(); }
       ctx.restore();
     }
-    const HEAD_COLORS = ['#00f5ff', '#ff5cf0', '#ffe04d', '#9cff66'];
-    function drawHeadsWorld(worldHeads) {
-      worldHeads.forEach((h, i) => {
-        const p = cached.toXY(h.x, h.y); const c = HEAD_COLORS[i % HEAD_COLORS.length];
-        ctx.shadowBlur = 10; ctx.shadowColor = c + '99'; ctx.fillStyle = c; ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
-        ctx.shadowBlur = 0; ctx.strokeStyle = c + '66'; ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI * 2); ctx.stroke();
+    const HEAD_COLORS=['#00f5ff','#ff5cf0','#ffe04d','#9cff66'];
+    function drawHeadsWorld(worldHeads){
+      worldHeads.forEach((h,i)=>{ const p=cached.toXY(h.x,h.y); const c=HEAD_COLORS[i%HEAD_COLORS.length];
+        ctx.shadowBlur=10; ctx.shadowColor=c+'99'; ctx.fillStyle=c; ctx.beginPath(); ctx.arc(p.x,p.y,4,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur=0; ctx.strokeStyle=c+'66'; ctx.beginPath(); ctx.arc(p.x,p.y,8,0,Math.PI*2); ctx.stroke();
       });
     }
-
-    function nearestPrintedBinOrBelow(targetBin) {
-      for (let i = targetBin; i >= 0; i--) { if (cached.binCount[i] > 0) return i; }
+    function nearestPrintedBinOrBelow(targetBin){
+      for (let i=targetBin;i>=0;i--){ if (cached.binCount[i]>0) return i; }
       return -1;
     }
 
-    function draw(status) {
+    function draw(status){
       if (!ctx) return;
-      const w = dims.w, h = dims.h;
-      ctx.clearRect(0, 0, w, h); drawGrid();
+      const w=dims.w,h=dims.h; ctx.clearRect(0,0,w,h); drawGrid();
       if (!parsed || !cached) return;
 
-      const single = ui.singleLayer.checked, heat = ui.heatmap.checked, showT = ui.showTravel.checked, showH = ui.showHeads.checked, onlyPrinted = ui.onlyPrinted.checked;
+      const single=ui.singleLayer.checked, heat=ui.heatmap.checked, showT=ui.showTravel.checked, showH=ui.showHeads.checked, onlyPrinted=ui.onlyPrinted.checked;
 
-      const zMin = cached.zMin, zMax = cached.zMax;
-      const zWin = parseFloat(ui.zWindow.value || '0.25'), zFrac = parseFloat(ui.zSlider.value || '0');
+      const zMin=cached.zMin,zMax=cached.zMax;
+      const zWin=parseFloat(ui.zWindow.value||'0.25'), zFrac=parseFloat(ui.zSlider.value||'0');
       let zC = zMin + (zMax - zMin) * zFrac;
 
-      // printed boundary from progress
-      let zPrintedHi = zC;
-      if (onlyPrinted && cached.endpoints.length) {
-        const idx = Math.min(cached.endpoints.length - 1, Math.floor(cached.endpoints.length * (lastCompletion || 0)));
-        zPrintedHi = cached.endpoints[idx].z;
+      // Printed boundary from live completion
+      let zPrintedHi=zC;
+      if (onlyPrinted){
+        const head = positionAtCompletion(lastCompletion||0);
+        if (head) zPrintedHi = head.z;
       }
 
-      const binH = (zMax - zMin) / cached.bins.length;
-      let targetBin = Math.max(0, Math.min(cached.bins.length - 1, Math.floor((zC - zMin) / (binH || 1))));
-      if (single && onlyPrinted) {
-        const printedBin = Math.max(0, Math.min(cached.bins.length - 1, Math.floor((zPrintedHi - zMin) / (binH || 1))));
-        targetBin = Math.min(targetBin, printedBin);
-        const snap = nearestPrintedBinOrBelow(targetBin);
-        if (snap >= 0) {
-          const low = cached.binLow[snap], high = cached.binHigh[snap];
-          zC = (low + high) / 2;
-        }
+      const binH=(zMax-zMin)/cached.bins.length;
+      let targetBin=Math.max(0,Math.min(cached.bins.length-1,Math.floor((zC - zMin)/(binH||1))));
+      if (single && onlyPrinted){
+        const printedBin=Math.max(0,Math.min(cached.bins.length-1,Math.floor(((zPrintedHi - zMin)/(binH||1)))));
+        targetBin=Math.min(targetBin,printedBin);
+        const snap=nearestPrintedBinOrBelow(targetBin);
+        if (snap>=0){ const low=cached.binLow[snap], high=cached.binHigh[snap]; zC=(low+high)/2; }
       }
 
       setText('zNow', zC.toFixed(3)); setText('zSpan', `${zMin.toFixed(3)}–${zMax.toFixed(3)}`); setText('zWin', zWin.toFixed(2));
-      if (showT) { ctx.lineWidth = 1.1; ctx.strokeStyle = 'rgba(180,190,210,0.28)'; ctx.stroke(cached.travels); }
+      if (showT){ ctx.lineWidth=1.1; ctx.strokeStyle='rgba(180,190,210,0.28)'; ctx.stroke(cached.travels); }
 
-      const zLo = zC - zWin / 2, zHi = zC + zWin / 2;
-      ctx.lineWidth = 2.0;
+      const zLo=zC - zWin/2, zHi=zC + zWin/2;
+      ctx.lineWidth=2.0;
+      const drawBin=(i,color)=>{ ctx.strokeStyle=color; ctx.stroke(cached.bins[i]); };
 
-      const drawBin = (i, color) => { ctx.strokeStyle = color; ctx.stroke(cached.bins[i]); };
-
-      if (heat) {
-        for (let i = 0; i < cached.bins.length; i++) {
-          const low = cached.binLow[i], high = cached.binHigh[i];
-          if (single && (high < zLo || low > zHi)) continue;
-          if (onlyPrinted && high > zPrintedHi + 1e-6) continue;
-          const t = ((low + high) / 2 - zMin) / (zMax - zMin || 1);
-          drawBin(i, hslToHex(200 + 140 * t, 100, 60));
+      if (heat){
+        for (let i=0;i<cached.bins.length;i++){ const low=cached.binLow[i], high=cached.binHigh[i];
+          if (single && (high<zLo || low>zHi)) continue;
+          if (onlyPrinted && high>zPrintedHi+1e-6) continue;
+          const t=((low+high)/2 - zMin)/(zMax - zMin || 1);
+          drawBin(i, hslToHex(200 + 140*t, 100, 60));
         }
       } else {
-        const grad = ctx.createLinearGradient(0, 0, w, h); grad.addColorStop(0, '#00f5ff'); grad.addColorStop(1, '#7c4dff');
-        for (let i = 0; i < cached.bins.length; i++) {
-          const low = cached.binLow[i], high = cached.binHigh[i];
-          if (single && (high < zLo || low > zHi)) continue;
-          if (onlyPrinted && high > zPrintedHi + 1e-6) continue;
+        const grad=ctx.createLinearGradient(0,0,w,h); grad.addColorStop(0,'#00f5ff'); grad.addColorStop(1,'#7c4dff');
+        for (let i=0;i<cached.bins.length;i++){ const low=cached.binLow[i], high=cached.binHigh[i];
+          if (single && (high<zLo || low>zHi)) continue;
+          if (onlyPrinted && high>zPrintedHi+1e-6) continue;
           drawBin(i, grad);
         }
       }
 
-      if (showH) {
-        if (status.heads && status.heads.length) {
-          drawHeadsWorld(status.heads);
-        } else if (cached.endpoints.length) {
-          const idx = Math.min(cached.endpoints.length - 1, Math.floor(cached.endpoints.length * (lastCompletion || 0)));
-          drawHeadsWorld([cached.endpoints[idx]]);
-        }
+      if (showH){
+        const head = positionAtCompletion(lastCompletion||0);
+        if (head) drawHeadsWorld([head]);
       }
 
-      el('overlay').textContent = `${cached.endpoints.length} segments • ${(lastCompletion * 100 || 0).toFixed(1)}% ${single ? `• Z≈${zC.toFixed(2)}mm` : ''}`;
+      el('overlay').textContent = `${parsed.segments.length} segments • ${(lastCompletion*100||0).toFixed(1)}% ${single?`• Z≈${zC.toFixed(2)}mm`:''}`;
     }
 
     /* ===== Data / polling ===== */
-    async function getNormalizedStatus() { const mode = await detectApiMode(); el('apiModePill').textContent = 'mode: ' + mode; return api.status().then(api.normalize); }
-    async function poll() {
-      try {
-        const st = await getNormalizedStatus();
-        setText('state', st?.state?.status || '—'); setText('uptime', (st?.system?.uptime ?? 0) + 's');
-        lastCompletion = st?.job?.progress?.completion ?? 0; setBar(lastCompletion); setText('prog', ((lastCompletion * 100) || 0).toFixed(1) + '%');
+    async function getNormalizedStatus(){ const mode=await detectApiMode(); el('apiModePill').textContent='mode: '+mode; return api.status().then(api.normalize); }
 
-        if (ui.followPrint.checked && cached) {
-          let targetFrac = null;
-          if (cached.endpoints && cached.endpoints.length) {
-            const idx = Math.min(cached.endpoints.length - 1, Math.floor(cached.endpoints.length * (lastCompletion || 0)));
-            const zNow = cached.endpoints[idx].z;
-            targetFrac = (zNow - cached.zMin) / (cached.zMax - cached.zMin || 1);
-          } else if (st.heads && st.heads[0] && Number.isFinite(st.heads[0].z)) {
-            const zNow = st.heads[0].z;
-            targetFrac = (zNow - cached.zMin) / (cached.zMax - cached.zMin || 1);
-          }
-          if (targetFrac != null && isFinite(targetFrac)) {
-            followZ = (followZ == null) ? targetFrac : (followZ * 0.85 + targetFrac * 0.15);
-            ui.zSlider.value = clamp01(followZ);
+    async function poll(){
+      try{
+        const st = await getNormalizedStatus();
+        setText('state', st?.state?.status || '—'); setText('uptime', (st?.system?.uptime ?? 0)+'s');
+        lastCompletion = st?.job?.progress?.completion ?? 0; setBar(lastCompletion); setText('prog', ((lastCompletion*100)||0).toFixed(1)+'%');
+
+        if (ui.followPrint.checked && cached){
+          const head = positionAtCompletion(lastCompletion||0);
+          if (head){
+            const targetFrac = (head.z - cached.zMin) / (cached.zMax - cached.zMin || 1);
+            if (isFinite(targetFrac)){
+              followZ = (followZ == null) ? targetFrac : (followZ*0.85 + targetFrac*0.15);
+              ui.zSlider.value = clamp01(followZ);
+            }
           }
         }
 
         const filePath = st?.job?.file?.fileName || null; setText('job', filePath || '—');
-        if (filePath && filePath !== lastJobPath) {
+        if (filePath && filePath !== lastJobPath){
           const name = filePath.replace(/^\/+/, '');
           log('Job file: ' + name + ' — fetching…');
           const txt = await api.download(name.startsWith('gcodes/') ? name : ('gcodes/' + name));
           parsed = parseGcodeText(txt); lastJobPath = filePath; rebuildCache();
-          log(`G-code loaded: ${parsed.segments.length} segments`); draw(st);
-        } else { draw(st); }
-      } catch (e) { log('poll error: ' + e.message); }
+          log(`G-code loaded: ${parsed.segments.length} segments, timeline ${(parsed.totalTime||0).toFixed(1)}s`);
+          draw(st);
+        } else {
+          draw(st);
+        }
+      } catch(e){ log('poll error: '+e.message); }
       finally { setTimeout(poll, 1000); }
     }
 
     /* ===== Upload / start ===== */
-    async function uploadAndStart(file) {
+    async function uploadAndStart(file){
       const dest = file.name || 'upload.gcode';
-      try {
+      try{
         await detectApiMode();
-        const r = await api.upload(file, dest); if (!r.ok) throw new Error('upload failed ' + r.status);
+        const r = await api.upload(file, dest); if (!r.ok) throw new Error('upload failed '+r.status);
         const serverFile = '/gcodes/' + dest; log('Uploaded: ' + serverFile);
-        const s = await api.start(serverFile); if (!s.ok) throw new Error('start failed ' + s.status);
+        const s = await api.start(serverFile); if (!s.ok) throw new Error('start failed '+s.status);
         log('Start command sent: ' + serverFile);
-      } catch (err) { log('upload/start error: ' + err.message + ' (starting from Duet Web Control is also fine)'); }
+      } catch(err){ log('upload/start error: '+err.message+' (starting from Duet Web Control is also fine)'); }
     }
 
     /* ===== Auto-scan (layer sweep) ===== */
-    function startScan() {
-      stopScan(); const speed = parseFloat(ui.scanSpeed.value || '0.25'); const step = speed / 2000;
-      function tick() {
-        if (!ui.autoScan.checked) { scanRAF = null; return; }
-        let v = parseFloat(ui.zSlider.value); v += step; if (v > 1) v = 0; ui.zSlider.value = v; draw({ heads: [] }); scanRAF = requestAnimationFrame(tick);
-      }
-      scanRAF = requestAnimationFrame(tick);
+    // let scanRAF=null; // Removed duplicate declaration
+    function startScan(){
+      stopScan(); const speed=parseFloat(ui.scanSpeed.value||'0.25'); const step=speed/2000;
+      function tick(){ if(!ui.autoScan.checked){ scanRAF=null; return; }
+        let v=parseFloat(ui.zSlider.value); v+=step; if(v>1) v=0; ui.zSlider.value=v; draw({}); scanRAF=requestAnimationFrame(tick); }
+      scanRAF=requestAnimationFrame(tick);
     }
-    function stopScan() { if (scanRAF) { cancelAnimationFrame(scanRAF); scanRAF = null; } }
+    function stopScan(){ if(scanRAF){ cancelAnimationFrame(scanRAF); scanRAF=null; } }
 
     /* ===== Bootstrap ===== */
-    function resize() {
-      const c = el('gcodeCanvas'), r = c.parentElement.getBoundingClientRect();
-      const w = Math.floor(r.width), h = Math.floor(r.height); if (w === dims.w && h === dims.h) return;
-      dims = { w, h }; c.width = w * devicePixelRatio; c.height = h * devicePixelRatio; c.style.width = w + 'px'; c.style.height = h + 'px';
-      ctx = c.getContext('2d'); ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); if (parsed) rebuildCache(); draw({ heads: [] });
+    function resize(){
+      const c=el('gcodeCanvas'), r=c.parentElement.getBoundingClientRect();
+      const w=Math.floor(r.width), h=Math.floor(r.height); if (w===dims.w && h===dims.h) return;
+      dims={w,h}; c.width=w*devicePixelRatio; c.height=h*devicePixelRatio; c.style.width=w+'px'; c.style.height=h+'px';
+      ctx=c.getContext('2d'); ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); if(parsed) rebuildCache(); draw({});
     }
-    function init() {
+    function init(){
       ui = {
         singleLayer: el('singleLayer'), heatmap: el('heatmap'), showTravel: el('showTravel'),
         showHeads: el('showHeads'), zSlider: el('zSlider'), zWindow: el('zWindow'),
         autoScan: el('autoScan'), scanSpeed: el('scanSpeed'), followPrint: el('followPrint'),
         onlyPrinted: el('onlyPrinted')
       };
-      el('apiBasePill').textContent = 'API: ' + API_BASE;
-      el('scanV').textContent = ui.scanSpeed.value;
-
+      el('apiBasePill').textContent='API: '+API_BASE;
+      el('scanV').textContent=ui.scanSpeed.value;
       ui.zSlider.disabled = ui.followPrint.checked;
 
-      el('file').addEventListener('change', e => { const f = e.target.files[0]; if (f) uploadAndStart(f); });
-      el('reloadBtn').addEventListener('click', () => { lastJobPath = null; });
+      el('file').addEventListener('change', e=>{ const f=e.target.files[0]; if(f) uploadAndStart(f); });
+      el('reloadBtn').addEventListener('click', ()=>{ lastJobPath=null; });
       window.addEventListener('resize', resize);
 
-      ['change', 'input'].forEach(ev => {
-        ui.singleLayer.addEventListener(ev, () => draw({ heads: [] })); ui.heatmap.addEventListener(ev, () => draw({ heads: [] }));
-        ui.showTravel.addEventListener(ev, () => draw({ heads: [] })); ui.showHeads.addEventListener(ev, () => draw({ heads: [] }));
-        ui.onlyPrinted.addEventListener(ev, () => draw({ heads: [] }));
-        ui.zSlider.addEventListener(ev, () => { followZ = null; draw({ heads: [] }); });
-        ui.zWindow.addEventListener(ev, () => draw({ heads: [] }));
-        ui.scanSpeed.addEventListener(ev, () => { el('scanV').textContent = ui.scanSpeed.value; if (ui.autoScan.checked) { startScan(); } });
-        ui.autoScan.addEventListener('change', () => {
-          if (ui.autoScan.checked) {
-            ui.followPrint.checked = false; ui.onlyPrinted.checked = false; ui.zSlider.disabled = false; startScan();
-          } else { stopScan(); }
-          draw({ heads: [] });
-        });
-        ui.followPrint.addEventListener(ev, () => {
-          ui.zSlider.disabled = ui.followPrint.checked;
-          if (ui.followPrint.checked) { ui.autoScan.checked = false; stopScan(); }
-          followZ = null; draw({ heads: [] });
-        });
+      ['change','input'].forEach(ev=>{
+        ui.singleLayer.addEventListener(ev, ()=>draw({}));
+        ui.heatmap.addEventListener(ev, ()=>draw({}));
+        ui.showTravel.addEventListener(ev, ()=>draw({}));
+        ui.showHeads.addEventListener(ev, ()=>draw({}));
+        ui.onlyPrinted.addEventListener(ev, ()=>draw({}));
+        ui.zSlider.addEventListener(ev, ()=>{ followZ=null; draw({}); });
+        ui.zWindow.addEventListener(ev, ()=>draw({}));
+        ui.scanSpeed.addEventListener(ev, ()=>{ el('scanV').textContent=ui.scanSpeed.value; if(ui.autoScan.checked){ startScan(); } });
+        ui.autoScan.addEventListener('change', ()=>{ if(ui.autoScan.checked){ ui.followPrint.checked=false; ui.onlyPrinted.checked=false; ui.zSlider.disabled=false; startScan(); } else { stopScan(); } draw({}); });
+        ui.followPrint.addEventListener(ev, ()=>{ ui.zSlider.disabled=ui.followPrint.checked; if(ui.followPrint.checked){ ui.autoScan.checked=false; stopScan(); } followZ=null; draw({}); });
       });
 
       canvas = el('gcodeCanvas'); ctx = canvas.getContext('2d'); resize(); poll();
