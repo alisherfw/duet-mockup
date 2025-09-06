@@ -52,7 +52,7 @@
           <div style="font-size:12px;color:var(--muted)">Smooth Path2D render • Live/Preview motion • Upload & start</div>
         </div>
       </div>
-      <div><img src="http://conception.co.kr/layouts/KSOTheme_Starter/src/img/logo-light.svg" alt="Logo" style="width: 100px;" /></div>
+      <div><img src="/logo.svg" alt="Logo" style="width: 100px;" /></div>
       <div class="right">
         <span class="pill" id="apiBasePill">API: …</span>
         <span class="pill" id="apiModePill">mode: auto</span>
@@ -78,13 +78,13 @@
         <div class="controls">
           <div class="ctl">
             <label>Mode</label>
-            <div class="switch"><input id="singleLayer" type="checkbox" checked /> Single-layer focus</div>
-            <div class="switch"><input id="heatmap" type="checkbox" /> Color by height</div>
-            <div class="switch"><input id="showTravel" type="checkbox" /> Show travel</div>
+            <div class="switch"><input id="singleLayer" type="checkbox"  /> Single-layer focus</div>
+            <div class="switch"><input id="heatmap" type="checkbox" checked /> Color by height</div>
+            <div class="switch"><input id="showTravel" type="checkbox" checked /> Show travel</div>
             <div class="switch"><input id="showHeads" type="checkbox" checked /> Show head(s)</div>
             <div class="switch"><input id="onlyPrinted" type="checkbox" checked /> Only show printed layers</div>
             <div class="switch"><input id="followPrint" type="checkbox" checked /> Follow current layer</div>
-            <div class="switch"><input id="autoScan" type="checkbox" /> Auto-scan layers</div>
+            <div class="switch"><input id="autoScan" type="checkbox" disabled /> Auto-scan layers</div>
           </div>
           <div class="ctl">
             <label>Layer (Z)</label>
@@ -125,8 +125,8 @@
 
   <script>
     /* ===== CONFIG ===== */
-    const API_BASE = 'http://127.0.0.1:3001';
-    let API_MODE = 'auto'; // 'auto' | 'mock' | 'duet'
+    const API_BASE = 'http://duet.local';
+    let API_MODE = 'duet'; // 'auto' | 'mock' | 'duet'
 
     /* ===== Normalized API adapters ===== */
     const PATHS = {
