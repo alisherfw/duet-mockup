@@ -20,7 +20,9 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
 const PORT = Number(process.env.PORT || 3001);
-const PRINT_SECONDS = Number(process.env.PRINT_SECONDS || 120);
+const PRINT_SECONDS = Number(process.env.PRINT_SECONDS || 429);
+// const FEED_MM_PER_MIN = 600; // F600 speed target
+
 
 // In-memory "SD" storage namespace
 // Keys look like 'gcodes/filename.gcode' to mimic Duet paths
@@ -136,6 +138,21 @@ function parseGcodeText(txt) {
   };
 }
 
+function printedLength(parsed) {
+  if (!parsed?.segments?.length) return 0;
+  let L = 0;
+  for (const s of parsed.segments) {
+    if (s.extrude) L += Math.hypot(s.x2 - s.x1, s.y2 - s.y1, s.z2 - s.z1);
+  }
+  return L;
+}
+function computeDurationMs(parsed, feed_mm_min = FEED_MM_PER_MIN) {
+  const v = Math.max(1e-6, feed_mm_min) / 60; // mm/s
+  const L = printedLength(parsed);
+  return Math.max(1000, (L / v) * 1000); // at least 1s
+}
+
+
 function setCurrentJobFromText(serverPath, text) {
   files.set(serverPath, text);
   machine.job.file = { fileName: '/' + serverPath }; // UI expects leading slash sometimes
@@ -175,10 +192,18 @@ function updateSimulation() {
 
     // Finish
     if (elapsed >= machine.job.estDuration) {
-      machine.state = 'idle';
-      machine.coords.xyz = [0, 0, machine.parsed.pMaxZ || 0];
+      // snap to end once, then immediately restart the same file
+      machine.coords.xyz = [machine.parsed.endpoints.at(-1)?.x || 0,
+      machine.parsed.endpoints.at(-1)?.y || 0,
+      machine.parsed.endpoints.at(-1)?.z || (machine.parsed.pMaxZ || 0)];
       machine.job.progress.completion = 1;
       machine.job.filePosition = machine.job.fileSize;
+
+      // restart
+      machine.state = 'printing';
+      machine.job.startTs = Date.now();
+      machine.job.progress.completion = 0;
+      machine.job.filePosition = 0;
     }
   } else if (st === 'idle') {
     // keep Z at min when idle
@@ -247,6 +272,7 @@ app.post('/machine/job/start', (req, res) => {
   machine.job.file = { fileName: '/' + p };
   machine.job.fileSize = Buffer.byteLength(txt, 'utf8');
   machine.parsed = parseGcodeText(txt);
+  machine.job.estDuration = computeDurationMs(machine.parsed, FEED_MM_PER_MIN);
   return res.json({ ok: true, started: '/' + p });
 });
 

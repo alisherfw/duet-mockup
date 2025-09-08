@@ -125,7 +125,7 @@
 
   <script>
     /* ===== CONFIG ===== */
-    const API_BASE = 'http://duet.local';
+    const API_BASE = 'http://localhost:3001';
     let API_MODE = 'duet'; // 'auto' | 'mock' | 'duet'
 
     /* ===== Normalized API adapters ===== */
@@ -399,7 +399,7 @@
       }
 
       setText('zNow', zC.toFixed(3)); setText('zSpan', `${zMin.toFixed(3)}–${zMax.toFixed(3)}`); setText('zWin', zWin.toFixed(2));
-      if (showT){ ctx.lineWidth=1.1; ctx.strokeStyle='rgba(180,190,210,0.28)'; ctx.stroke(cached.travels); }
+      if (showT){ ctx.lineWidth=1.1; ctx.strokeStyle='rgba(19, 220, 255, 0.58)'; ctx.stroke(cached.travels); }
 
       const zLo=zC - zWin/2, zHi=zC + zWin/2;
       ctx.lineWidth=2.0;
