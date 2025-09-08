@@ -169,9 +169,17 @@
     /* ===== Runtime state ===== */
     let parsed = null, canvas, ctx, dims = { w: 0, h: 0 };
     let ui = {}; let lastCompletion = 0; let lastJobPath = null; let api = PATHS.mock;
-    let cached = null; // geometry cache (bins, travels, endpoints)
+    let cached = null; // full geometry cache
+    let printed = null; // progressively built geometry
+    let printedZMax = 0;
+    let buildIdx = 0, animIdx = 0; // progression indices
+    let headPos = [{x:0,y:0,z:0},{x:0,y:0,z:0},{x:0,y:0,z:0}];
+    let currentPartial = null;
+    let animStart = 0, lastLoopT = 0, animRAF = null;
+    let animCompletion = 0, printedCompletion = 0;
     let scanRAF = null;
     let followZ = null;
+    const LOOP_FEED = 600; // mm/min
 
     /* ===== Helpers ===== */
     const el = id => document.getElementById(id);
@@ -182,6 +190,13 @@
     function clamp01(x){return Math.max(0,Math.min(1,x));}
     function lowerBound(arr, x, get=(v)=>v){ let lo=0, hi=arr.length; while(lo<hi){ const mid=(lo+hi>>>1); if(get(arr[mid])<x) lo=mid+1; else hi=mid; } return lo; }
 
+    function normalizeJobPath(p){
+      if(!p) return null;
+      const name = p.replace(/\\/g,'/').replace(/^\/+/, '');
+      const stripped = name.replace(/^(?:gcodes\/)+/i,'');
+      return '/gcodes/' + stripped;
+    }
+
     async function detectApiMode() {
       if (API_MODE !== 'auto') return API_MODE;
       try { const r = await fetch(API_BASE + '/machine/status', { cache: 'no-store' }); if (r.ok) { API_MODE = 'mock'; api = PATHS.mock; return API_MODE; } } catch {}
@@ -189,116 +204,71 @@
       API_MODE = 'mock'; api = PATHS.mock; return API_MODE;
     }
 
-    /* ===== Parser (G0/G1 + G2/G3) + Cura-comment fallback + Feedrate timeline ===== */
+    /* ===== Parser (multi-head G0/G1) ===== */
     function parseGcodeText(txt) {
       let posAbs = true, eAbs = true;
-      let x=null, y=null, z=0, e=0, f=1800; // F in mm/min (default)
-      let currentLayer=null, layerHeight=null;
+      let x=0, u=0, v=0, y=0, z=0, e=0;
+      let hasE=false, currentLayer=null, layerHeight=null;
       const segments=[];
 
-      const PUSH = (x1,y1,z1,x2,y2,z2,extrude,feed) => {
-        if (x1==null || y1==null) return;
-        if (x1===x2 && y1===y2 && z1===z2) return;
-        segments.push({ x1,y1,z1,x2,y2,z2,extrude,f:feed });
-      };
-
       const lines = txt.split(/\r?\n/);
-      for (const raw of lines) {
-        // Track Cura layer comments for fallback Z
+      for (const raw of lines){
         const mL = raw.match(/^;LAYER:(\d+)/i); if (mL) currentLayer = parseInt(mL[1],10);
         const mLH = raw.match(/^;Layer height:\s*([\d.]+)/i); if (mLH) layerHeight = parseFloat(mLH[1]);
 
-        const line = raw.split(';')[0].trim(); if (!line) continue;
+        let line = raw.replace(/^N\d+\s*/i,'');
+        line = line.split(';')[0].trim(); if(!line) continue;
 
-        if (/^G90\b/i.test(line)) { posAbs = true; continue; }
-        if (/^G91\b/i.test(line)) { posAbs = false; continue; }
-        if (/^M82\b/i.test(line)) { eAbs = true; continue; }
-        if (/^M83\b/i.test(line)) { eAbs = false; continue; }
+        if (/\bG90\b/i.test(line)) { posAbs=true; continue; }
+        if (/\bG91\b/i.test(line)) { posAbs=false; continue; }
+        if (/\bM82\b/i.test(line)) { eAbs=true; continue; }
+        if (/\bM83\b/i.test(line)) { eAbs=false; continue; }
+        if (/\bG92\b/i.test(line)) { const mE=/E(-?\d+(?:\.\d+)?)/i.exec(line); if(mE){ e=parseFloat(mE[1]); hasE=true; } continue; }
 
-        if (/^G92\b/i.test(line)) { const mE=/E(-?\d+(?:\.\d+)?)/i.exec(line); if(mE) e=parseFloat(mE[1]); continue; }
+        if (/\bG0?1\b/i.test(line)) {
+          const mX=/X(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mU=/U(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mV=/V(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mY=/Y(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mZ=/Z(-?\d+(?:\.\d+)?)/i.exec(line);
+          const mE=/E(-?\d+(?:\.\d+)?)/i.exec(line);
 
-        const mF=/F(-?\d+(?:\.\d+)?)/i.exec(line); if (mF) f = parseFloat(mF[1]);
+          let nx = mX ? (posAbs?parseFloat(mX[1]):x+parseFloat(mX[1])) : x;
+          let nu = mU ? (posAbs?parseFloat(mU[1]):u+parseFloat(mU[1])) : u;
+          let nv = mV ? (posAbs?parseFloat(mV[1]):v+parseFloat(mV[1])) : v;
+          let ny = mY ? (posAbs?parseFloat(mY[1]):y+parseFloat(mY[1])) : y;
+          let nz = mZ ? (posAbs?parseFloat(mZ[1]):z+parseFloat(mZ[1])) :
+                   (!mZ && layerHeight!=null && currentLayer!=null ? currentLayer*layerHeight : z);
+          let ne = mE ? (eAbs?parseFloat(mE[1]):e+parseFloat(mE[1])) : e;
+          if (mE) hasE=true;
+          const de = ne - e;
+          const extr = mE ? (de>0) : !hasE;
 
-        // ---- ARCS ----
-        if (/^G2\b|^G3\b/i.test(line)) {
-          const cw = /^G2\b/i.test(line);
-          const mX=/X(-?\d+(?:\.\d+)?)/i.exec(line), mY=/Y(-?\d+(?:\.\d+)?)/i.exec(line),
-                mZ=/Z(-?\d+(?:\.\d+)?)/i.exec(line), mE=/E(-?\d+(?:\.\d+)?)/i.exec(line),
-                mI=/I(-?\d+(?:\.\d+)?)/i.exec(line), mJ=/J(-?\d+(?:\.\d+)?)/i.exec(line), mR=/R(-?\d+(?:\.\d+)?)/i.exec(line);
-
-          let nx=x, ny=y, nz=z, ne=e;
-          if (mX) nx=(x===null||posAbs)?parseFloat(mX[1]):x+parseFloat(mX[1]);
-          if (mY) ny=(y===null||posAbs)?parseFloat(mY[1]):y+parseFloat(mY[1]);
-          if (mZ) nz=posAbs?parseFloat(mZ[1]):z+parseFloat(mZ[1]);
-          if (mE) ne=eAbs?parseFloat(mE[1]):e+parseFloat(mE[1]);
-          if (!mZ && layerHeight!=null && currentLayer!=null) nz=currentLayer*layerHeight;
-          if (x==null||y==null||nx==null||ny==null){ x=nx??x; y=ny??y; z=nz; e=ne; continue; }
-
-          let cx,cy,r,ang0,ang1;
-          if (mI||mJ){
-            const I=mI?parseFloat(mI[1]):0, J=mJ?parseFloat(mJ[1]):0;
-            cx=(posAbs?x:0)+I; cy=(posAbs?y:0)+J;
-            r=Math.hypot(x-cx,y-cy);
-            ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx);
-          } else if (mR){
-            r=Math.abs(parseFloat(mR[1]));
-            const mx=(x+nx)/2, my=(y+ny)/2, dx=nx-x, dy=ny-y, q=Math.hypot(dx,dy);
-            if(q===0){ x=nx; y=ny; z=nz; e=ne; continue; }
-            const h=Math.sqrt(Math.max(0,r*r-(q*q)/4)), ux=-dy/q, uy=dx/q;
-            const cxa=mx+ux*h, cya=my+uy*h, cxb=mx-ux*h, cyb=my-uy*h;
-            function sweepSign(cx,cy){ const a0=Math.atan2(y-cy,x-cx), a1=Math.atan2(ny-cy,nx-cx); let d=a1-a0; d=((d+Math.PI*2)%(Math.PI*2)); return d>Math.PI?d-2*Math.PI:d; }
-            if ((cw && sweepSign(cxa,cya)<0) || (!cw && sweepSign(cxa,cya)>0)) { cx=cxa; cy=cya; }
-            else { cx=cxb; cy=cyb; }
-            ang0=Math.atan2(y-cy,x-cx); ang1=Math.atan2(ny-cy,nx-cx);
-          } else {
-            const de=mE?(ne-e):0, extr=mE?(de>0):false;
-            PUSH(x,y,z,nx,ny,nz,extr,f); x=nx;y=ny;z=nz;e=ne;continue;
-          }
-
-          let dAng=ang1-ang0; if (cw && dAng>0) dAng-=Math.PI*2; if (!cw && dAng<0) dAng+=Math.PI*2;
-          const segs=Math.max(8,Math.min(64,Math.ceil(Math.abs(dAng)/(Math.PI/16))));
-          const de=mE?(ne-e):0, extr=mE?(de>0):false;
-          let px=x, py=y, pz=z;
-          for (let i=1;i<=segs;i++){
-            const t=i/segs, ang=ang0+dAng*t;
-            const qx=cx+r*Math.cos(ang), qy=cy+r*Math.sin(ang), qz=z+(nz-z)*t;
-            PUSH(px,py,pz,qx,qy,qz,extr,f);
-            px=qx; py=qy; pz=qz;
-          }
-          x=nx; y=ny; z=nz; e=ne; continue;
-        }
-
-        // ---- LINES ----
-        if (/^G0?1\b/i.test(line)) {
-          const mX=/X(-?\d+(?:\.\d+)?)/i.exec(line), mY=/Y(-?\d+(?:\.\d+)?)/i.exec(line),
-                mZ=/Z(-?\d+(?:\.\d+)?)/i.exec(line), mE=/E(-?\d+(?:\.\d+)?)/i.exec(line);
-          let nx=x, ny=y, nz=z, ne=e;
-          if (mX) nx=(x===null||posAbs)?parseFloat(mX[1]):x+parseFloat(mX[1]);
-          if (mY) ny=(y===null||posAbs)?parseFloat(mY[1]):y+parseFloat(mY[1]);
-          if (mZ) nz=posAbs?parseFloat(mZ[1]):z+parseFloat(mZ[1]);
-          if (mE) ne=eAbs?parseFloat(mE[1]):e+parseFloat(mE[1]);
-          if (!mZ && layerHeight!=null && currentLayer!=null) nz=currentLayer*layerHeight;
-
-          if (x===null||y===null){ x=nx??x; y=ny??y; z=nz; e=ne; continue; }
-          const moved=(nx!==null&&ny!==null&&(nx!==x||ny!==y||nz!==z));
-          const de=mE?(ne-e):0; const extrude=mE?(de>0):false; // keep ALL positive E
-          if (moved) PUSH(x,y,z,nx??x,ny??y,nz,extrude,f);
-          x=nx??x; y=ny??y; z=nz; e=ne; continue;
+          const prevY=y, prevZ=z;
+          const heads=[{old:x,next:nx,idx:0},{old:u,next:nu,idx:1},{old:v,next:nv,idx:2}];
+          heads.forEach(h=>{
+            if (h.old!==h.next || prevY!==ny || prevZ!==nz){
+              segments.push({head:h.idx,x1:h.old,y1:prevY,z1:prevZ,x2:h.next,y2:ny,z2:nz,extrude:extr});
+            }
+          });
+          x=nx; u=nu; v=nv; y=ny; z=nz; e=ne;
         }
       }
 
       // BBox
       let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
-      for (const s of segments){ minX=Math.min(minX,s.x1,s.x2); minY=Math.min(minY,s.y1,s.y2); minZ=Math.min(minZ,s.z1,s.z2);
-                                 maxX=Math.max(maxX,s.x1,s.x2); maxY=Math.max(maxY,s.y1,s.y2); maxZ=Math.max(maxZ,s.z1,s.z2); }
+      for (const s of segments){
+        minX=Math.min(minX,s.x1,s.x2); minY=Math.min(minY,s.y1,s.y2); minZ=Math.min(minZ,s.z1,s.z2);
+        maxX=Math.max(maxX,s.x1,s.x2); maxY=Math.max(maxY,s.y1,s.y2); maxZ=Math.max(maxZ,s.z1,s.z2);
+      }
       if(!isFinite(minX)){ minX=0;minY=0;minZ=0;maxX=10;maxY=10;maxZ=1; }
 
-      // Build timeline (Cura-style)
-      let t=0; const times=[]; // end times
-      for (const s of segments){
-        const v=(s.f>0?s.f:1800)/60; // mm/s
+      // Timeline @ constant F600
+      const V = LOOP_FEED/60;
+      let t=0; const times=[];
+      for(const s of segments){
         const L=Math.hypot(s.x2-s.x1,s.y2-s.y1,s.z2-s.z1);
-        s.dt = v>0 ? L/v : 0;
+        s.dt = L/V;
         s.t0 = t; t += s.dt; s.t1 = t;
         times.push(s.t1);
       }
@@ -333,23 +303,86 @@
       }
 
       cached = { bins, travels, endpoints, zMin, zMax, bbox, ox, oy, scale:s, margin:m, toXY, binLow, binHigh, binCount };
+
+      // reset printed cache for animation
+      const BIN2=cached.bins.length;
+      printed = { bins:Array.from({length:BIN2},()=>new Path2D()), travels:new Path2D(), endpoints:[], zMin, zMax, bbox, ox, oy, scale:s, margin:m, toXY, binLow, binHigh, binCount:new Array(BIN2).fill(0) };
+      printedZMax = zMin;
+      buildIdx = 0; animIdx = 0; headPos = [{x:0,y:0,z:0},{x:0,y:0,z:0},{x:0,y:0,z:0}]; currentPartial=null; animStart=performance.now(); lastLoopT=0; animCompletion=0; printedCompletion=0;
+    }
+
+    function addPrintedSegment(seg){
+      if(!printed) return;
+      const a=printed.toXY(seg.x1,seg.y1), b=printed.toXY(seg.x2,seg.y2);
+      const zMin=printed.zMin, zMax=printed.zMax;
+      const zMid=(seg.z1+seg.z2)/2; const t=(zMid - zMin)/(zMax - zMin || 1);
+      const bi=Math.min(printed.bins.length-1,Math.max(0,Math.floor(t*printed.bins.length)));
+      if(seg.extrude){ printed.bins[bi].moveTo(a.x,a.y); printed.bins[bi].lineTo(b.x,b.y); printed.endpoints.push({x:seg.x2,y:seg.y2,z:seg.z2,bin:bi}); printed.binCount[bi]++; printedZMax=Math.max(printedZMax, seg.z1, seg.z2); }
+      else { printed.travels.moveTo(a.x,a.y); printed.travels.lineTo(b.x,b.y); }
+    }
+
+    function startAnimation(){
+      animStart = performance.now();
+      animIdx = 0; headPos = [{x:0,y:0,z:0},{x:0,y:0,z:0},{x:0,y:0,z:0}]; currentPartial=null; lastLoopT=0; animCompletion=0;
+      printedCompletion=0; if(animRAF) cancelAnimationFrame(animRAF); animRAF=requestAnimationFrame(tick);
+    }
+
+    function tick(){
+      if(!parsed){ animRAF=requestAnimationFrame(tick); return; }
+      const now=performance.now();
+      const elapsed=(now - animStart)/1000;
+      const loopTime=parsed.totalTime||1;
+      const loopT=elapsed % loopTime;
+      animCompletion=loopT/loopTime;
+      printedCompletion=Math.min(1,elapsed/loopTime);
+
+      while(buildIdx < parsed.segments.length && elapsed >= parsed.segments[buildIdx].t1){
+        addPrintedSegment(parsed.segments[buildIdx]);
+        buildIdx++;
+      }
+
+      if(loopT < lastLoopT){ // restart
+        animIdx=0; headPos=[{x:0,y:0,z:0},{x:0,y:0,z:0},{x:0,y:0,z:0}];
+      }
+
+      while(animIdx < parsed.segments.length && loopT >= parsed.segments[animIdx].t1){
+        const s=parsed.segments[animIdx];
+        headPos[s.head]={x:s.x2,y:s.y2,z:s.z2};
+        animIdx++;
+      }
+
+      if(animIdx < parsed.segments.length){
+        const s=parsed.segments[animIdx];
+        const u=(loopT - s.t0)/s.dt;
+        headPos[s.head]={x:s.x1+(s.x2-s.x1)*u, y:s.y1+(s.y2-s.y1)*u, z:s.z1+(s.z2-s.z1)*u};
+        currentPartial={head:s.head,x1:s.x1,y1:s.y1,z1:s.z1,x2:headPos[s.head].x,y2:headPos[s.head].y,z2:headPos[s.head].z,extrude:s.extrude};
+      } else {
+        currentPartial=null;
+      }
+
+      lastLoopT=loopT;
+      draw();
+      animRAF=requestAnimationFrame(tick);
     }
 
     /* ===== Sampling along the timeline ===== */
-    function positionAtTime(t){
+    function positionsAtTime(t){
       if (!parsed || !parsed.segments.length) return null;
-      const times = parsed.times;
-      const i = lowerBound(times, t);
-      const idx = Math.min(Math.max(i, 0), parsed.segments.length - 1);
-      const s = parsed.segments[idx];
-      const u = (s.dt>0) ? Math.min(1, Math.max(0, (t - s.t0) / s.dt)) : 1;
-      return { x: s.x1 + (s.x2 - s.x1)*u, y: s.y1 + (s.y2 - s.y1)*u, z: s.z1 + (s.z2 - s.z1)*u };
+      const pos=[{x:0,y:0,z:0},{x:0,y:0,z:0},{x:0,y:0,z:0}];
+      let i=0;
+      for(; i<parsed.segments.length && t>=parsed.segments[i].t1; i++){
+        const s=parsed.segments[i];
+        pos[s.head]={x:s.x2,y:s.y2,z:s.z2};
+      }
+      if(i<parsed.segments.length){
+        const s=parsed.segments[i];
+        const u=(s.dt>0)?Math.min(1,Math.max(0,(t - s.t0)/s.dt)):1;
+        pos[s.head]={x:s.x1+(s.x2-s.x1)*u, y:s.y1+(s.y2-s.y1)*u, z:s.z1+(s.z2-s.z1)*u};
+      }
+      return pos;
     }
-    function positionAtCompletion(frac){
-      if (!parsed) return null;
-      const t = clamp01(frac) * (parsed.totalTime || 0);
-      return positionAtTime(t);
-    }
+    function positionAtTime(t){ const p=positionsAtTime(t); return p?p[0]:null; }
+    function positionAtCompletion(frac){ if(!parsed) return null; const t=clamp01(frac)*(parsed.totalTime||0); return positionAtTime(t); }
 
     /* ===== Render ===== */
     function drawGrid() {
@@ -367,66 +400,70 @@
       });
     }
     function nearestPrintedBinOrBelow(targetBin){
-      for (let i=targetBin;i>=0;i--){ if (cached.binCount[i]>0) return i; }
+      for (let i=targetBin;i>=0;i--){ if (printed.binCount[i]>0) return i; }
       return -1;
     }
 
-    function draw(status){
+    function draw(){
       if (!ctx) return;
       const w=dims.w,h=dims.h; ctx.clearRect(0,0,w,h); drawGrid();
-      if (!parsed || !cached) return;
+      if (!parsed || !printed) return;
 
       const single=ui.singleLayer.checked, heat=ui.heatmap.checked, showT=ui.showTravel.checked, showH=ui.showHeads.checked, onlyPrinted=ui.onlyPrinted.checked;
 
-      const zMin=cached.zMin,zMax=cached.zMax;
+      const zMin=printed.zMin,zMax=printed.zMax;
       const zWin=parseFloat(ui.zWindow.value||'0.25'), zFrac=parseFloat(ui.zSlider.value||'0');
       let zC = zMin + (zMax - zMin) * zFrac;
 
-      // Printed boundary from live completion
-      let zPrintedHi=zC;
-      if (onlyPrinted){
-        const head = positionAtCompletion(lastCompletion||0);
-        if (head) zPrintedHi = head.z;
-      }
+      let zPrintedHi=printedZMax;
 
-      const binH=(zMax-zMin)/cached.bins.length;
-      let targetBin=Math.max(0,Math.min(cached.bins.length-1,Math.floor((zC - zMin)/(binH||1))));
+      const binH=(zMax-zMin)/printed.bins.length;
+      let targetBin=Math.max(0,Math.min(printed.bins.length-1,Math.floor((zC - zMin)/(binH||1))));
       if (single && onlyPrinted){
-        const printedBin=Math.max(0,Math.min(cached.bins.length-1,Math.floor(((zPrintedHi - zMin)/(binH||1)))));
+        const printedBin=Math.max(0,Math.min(printed.bins.length-1,Math.floor(((zPrintedHi - zMin)/(binH||1)))));
         targetBin=Math.min(targetBin,printedBin);
         const snap=nearestPrintedBinOrBelow(targetBin);
-        if (snap>=0){ const low=cached.binLow[snap], high=cached.binHigh[snap]; zC=(low+high)/2; }
+        if (snap>=0){ const low=printed.binLow[snap], high=printed.binHigh[snap]; zC=(low+high)/2; }
       }
 
       setText('zNow', zC.toFixed(3)); setText('zSpan', `${zMin.toFixed(3)}–${zMax.toFixed(3)}`); setText('zWin', zWin.toFixed(2));
-      if (showT){ ctx.lineWidth=1.1; ctx.strokeStyle='rgba(19, 220, 255, 0.58)'; ctx.stroke(cached.travels); }
+      if (showT){ ctx.lineWidth=1.1; ctx.strokeStyle='rgba(19, 220, 255, 0.58)'; ctx.stroke(printed.travels); }
 
       const zLo=zC - zWin/2, zHi=zC + zWin/2;
       ctx.lineWidth=2.0;
-      const drawBin=(i,color)=>{ ctx.strokeStyle=color; ctx.stroke(cached.bins[i]); };
+      const drawBin=(cache,i,color)=>{ ctx.strokeStyle=color; ctx.stroke(cache.bins[i]); };
 
       if (heat){
-        for (let i=0;i<cached.bins.length;i++){ const low=cached.binLow[i], high=cached.binHigh[i];
+        for (let i=0;i<printed.bins.length;i++){ const low=printed.binLow[i], high=printed.binHigh[i];
           if (single && (high<zLo || low>zHi)) continue;
           if (onlyPrinted && high>zPrintedHi+1e-6) continue;
           const t=((low+high)/2 - zMin)/(zMax - zMin || 1);
-          drawBin(i, hslToHex(200 + 140*t, 100, 60));
+          drawBin(printed,i, hslToHex(200 + 140*t, 100, 60));
         }
       } else {
         const grad=ctx.createLinearGradient(0,0,w,h); grad.addColorStop(0,'#00f5ff'); grad.addColorStop(1,'#7c4dff');
-        for (let i=0;i<cached.bins.length;i++){ const low=cached.binLow[i], high=cached.binHigh[i];
+        for (let i=0;i<printed.bins.length;i++){ const low=printed.binLow[i], high=printed.binHigh[i];
           if (single && (high<zLo || low>zHi)) continue;
           if (onlyPrinted && high>zPrintedHi+1e-6) continue;
-          drawBin(i, grad);
+          drawBin(printed,i, grad);
         }
       }
 
-      if (showH){
-        const head = positionAtCompletion(lastCompletion||0);
-        if (head) drawHeadsWorld([head]);
+      if (buildIdx < parsed.segments.length && currentPartial){
+        const seg=currentPartial;
+        const zMid=(seg.z1+seg.z2)/2;
+        if ((seg.extrude || showT) && !(single && (zMid<zLo || zMid>zHi)) && !(onlyPrinted && zMid>zPrintedHi+1e-6)){
+          const a=printed.toXY(seg.x1,seg.y1), b=printed.toXY(seg.x2,seg.y2);
+          let color;
+          if (heat){ const t=(zMid - zMin)/(zMax - zMin ||1); color=hslToHex(200+140*t,100,60); }
+          else { const g=ctx.createLinearGradient(0,0,w,h); g.addColorStop(0,'#00f5ff'); g.addColorStop(1,'#7c4dff'); color=g; }
+          ctx.strokeStyle=color; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+        }
       }
 
-      el('overlay').textContent = `${parsed.segments.length} segments • ${(lastCompletion*100||0).toFixed(1)}% ${single?`• Z≈${zC.toFixed(2)}mm`:''}`;
+      if (showH) drawHeadsWorld(headPos);
+
+      el('overlay').textContent = `${parsed.segments.length} segments • ${(animCompletion*100).toFixed(1)}% loop`;
     }
 
     /* ===== Data / polling ===== */
@@ -451,14 +488,12 @@
 
         const filePath = st?.job?.file?.fileName || null; setText('job', filePath || '—');
         if (filePath && filePath !== lastJobPath){
-          const name = filePath.replace(/^\/+/, '');
-          log('Job file: ' + name + ' — fetching…');
-          const txt = await api.download(name.startsWith('gcodes/') ? name : ('gcodes/' + name));
+          const norm = normalizeJobPath(filePath);
+          log('Job file: ' + norm + ' — fetching…');
+          const txt = await api.download(norm.replace(/^\/+/, ''));
           parsed = parseGcodeText(txt); lastJobPath = filePath; rebuildCache();
-          log(`G-code loaded: ${parsed.segments.length} segments, timeline ${(parsed.totalTime||0).toFixed(1)}s`);
-          draw(st);
-        } else {
-          draw(st);
+          startAnimation();
+          log(`G-code loaded: ${parsed.segments.length} segments • heads=3 • loop ${(parsed.totalTime||0).toFixed(1)}s @ F600`);
         }
       } catch(e){ log('poll error: '+e.message); }
       finally { setTimeout(poll, 1000); }
@@ -480,8 +515,8 @@
     // let scanRAF=null; // Removed duplicate declaration
     function startScan(){
       stopScan(); const speed=parseFloat(ui.scanSpeed.value||'0.25'); const step=speed/2000;
-      function tick(){ if(!ui.autoScan.checked){ scanRAF=null; return; }
-        let v=parseFloat(ui.zSlider.value); v+=step; if(v>1) v=0; ui.zSlider.value=v; draw({}); scanRAF=requestAnimationFrame(tick); }
+        function tick(){ if(!ui.autoScan.checked){ scanRAF=null; return; }
+          let v=parseFloat(ui.zSlider.value); v+=step; if(v>1) v=0; ui.zSlider.value=v; draw(); scanRAF=requestAnimationFrame(tick); }
       scanRAF=requestAnimationFrame(tick);
     }
     function stopScan(){ if(scanRAF){ cancelAnimationFrame(scanRAF); scanRAF=null; } }
@@ -491,7 +526,7 @@
       const c=el('gcodeCanvas'), r=c.parentElement.getBoundingClientRect();
       const w=Math.floor(r.width), h=Math.floor(r.height); if (w===dims.w && h===dims.h) return;
       dims={w,h}; c.width=w*devicePixelRatio; c.height=h*devicePixelRatio; c.style.width=w+'px'; c.style.height=h+'px';
-      ctx=c.getContext('2d'); ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); if(parsed) rebuildCache(); draw({});
+        ctx=c.getContext('2d'); ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); if(parsed) rebuildCache(); draw();
     }
     function init(){
       ui = {
@@ -509,17 +544,17 @@
       window.addEventListener('resize', resize);
 
       ['change','input'].forEach(ev=>{
-        ui.singleLayer.addEventListener(ev, ()=>draw({}));
-        ui.heatmap.addEventListener(ev, ()=>draw({}));
-        ui.showTravel.addEventListener(ev, ()=>draw({}));
-        ui.showHeads.addEventListener(ev, ()=>draw({}));
-        ui.onlyPrinted.addEventListener(ev, ()=>draw({}));
-        ui.zSlider.addEventListener(ev, ()=>{ followZ=null; draw({}); });
-        ui.zWindow.addEventListener(ev, ()=>draw({}));
-        ui.scanSpeed.addEventListener(ev, ()=>{ el('scanV').textContent=ui.scanSpeed.value; if(ui.autoScan.checked){ startScan(); } });
-        ui.autoScan.addEventListener('change', ()=>{ if(ui.autoScan.checked){ ui.followPrint.checked=false; ui.onlyPrinted.checked=false; ui.zSlider.disabled=false; startScan(); } else { stopScan(); } draw({}); });
-        ui.followPrint.addEventListener(ev, ()=>{ ui.zSlider.disabled=ui.followPrint.checked; if(ui.followPrint.checked){ ui.autoScan.checked=false; stopScan(); } followZ=null; draw({}); });
-      });
+          ui.singleLayer.addEventListener(ev, ()=>draw());
+          ui.heatmap.addEventListener(ev, ()=>draw());
+          ui.showTravel.addEventListener(ev, ()=>draw());
+          ui.showHeads.addEventListener(ev, ()=>draw());
+          ui.onlyPrinted.addEventListener(ev, ()=>draw());
+          ui.zSlider.addEventListener(ev, ()=>{ followZ=null; draw(); });
+          ui.zWindow.addEventListener(ev, ()=>draw());
+          ui.scanSpeed.addEventListener(ev, ()=>{ el('scanV').textContent=ui.scanSpeed.value; if(ui.autoScan.checked){ startScan(); } });
+          ui.autoScan.addEventListener('change', ()=>{ if(ui.autoScan.checked){ ui.followPrint.checked=false; ui.onlyPrinted.checked=false; ui.zSlider.disabled=false; startScan(); } else { stopScan(); } draw(); });
+          ui.followPrint.addEventListener(ev, ()=>{ ui.zSlider.disabled=ui.followPrint.checked; if(ui.followPrint.checked){ ui.autoScan.checked=false; stopScan(); } followZ=null; draw(); });
+        });
 
       canvas = el('gcodeCanvas'); ctx = canvas.getContext('2d'); resize(); poll();
     }
