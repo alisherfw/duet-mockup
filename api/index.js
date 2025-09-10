@@ -20,7 +20,7 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
 const PORT = Number(process.env.PORT || 3001);
-const PRINT_SECONDS = Number(process.env.PRINT_SECONDS || 800);
+const PRINT_SECONDS = Number(process.env.PRINT_SECONDS || 429);
 // const FEED_MM_PER_MIN = 600; // F600 speed target
 
 

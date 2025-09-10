@@ -168,11 +168,19 @@
 
     /* ===== Runtime state ===== */
     let parsed = null, canvas, ctx, dims = { w: 0, h: 0 };
-    let ui = {}; let lastCompletion = 0; let lastJobPath = null; let api = PATHS.mock;
+    let ui = {}; let lastJobPath = null; let api = PATHS.mock;
     let cached = null; // geometry cache (bins, travels, endpoints)
     let scanRAF = null;
     let followZ = null;
-    let animStart = 0, printedUntil = 0, loopTime = 0, animHeads = null;
+    let serverCompletion = 0;
+    let loopStart = null, loopCompletion = 0, printedCompletion = 0, printedAll = false;
+
+    function normalizeJobFilePath(p){
+      if(!p) return null;
+      let n = p.trim().replace(/^\/+/, '');
+      n = n.replace(/^gcodes\/+/, '');
+      return '/gcodes/' + n;
+    }
 
     /* ===== Helpers ===== */
     const el = id => document.getElementById(id);
@@ -190,134 +198,122 @@
       API_MODE = 'mock'; api = PATHS.mock; return API_MODE;
     }
 
-    /* ===== Parser (multi-head, G0/G1) ===== */
+    /* ===== Parser for multi-head (G0/G1 on X/U/V/Y/Z) ===== */
     function parseGcodeText(txt){
-      let posAbs=true, eAbs=true;
-      let x=0, y=0, z=0, u=0, v=0, e=0;
-      const segments=[], times=[], xEnd=[], uEnd=[], vEnd=[], yEnd=[], zEnd=[];
-      let t=0; let anyE=false;
+      let posAbs=true;
+      const heads=[{x:0,y:0,z:0},{x:0,y:0,z:0},{x:0,y:0,z:0}];
+      const commands=[]; const segments=[]; let t=0;
       const lines=txt.split(/\r?\n/);
       for(const raw of lines){
-        let line=raw.split(';')[0].trim();
-        if(!line) continue;
-        line=line.replace(/^N\d+\s*/i,'');
-        if(/G90\b/i.test(line)){ posAbs=true; continue; }
-        if(/G91\b/i.test(line)){ posAbs=false; continue; }
-        if(/M82\b/i.test(line)){ eAbs=true; continue; }
-        if(/M83\b/i.test(line)){ eAbs=false; continue; }
-        if(/G92\b/i.test(line)){ const mE=/E(-?\d+(?:\.\d+)?)/i.exec(line); if(mE) e=parseFloat(mE[1]); continue; }
-        if(/G0?1\b/i.test(line)){
+        const line0=raw.split(';')[0].trim(); if(!line0) continue;
+        const line=line0.replace(/^N\d+\s*/i,'');
+        if(/\bG90\b/i.test(line)){ posAbs=true; continue; }
+        if(/\bG91\b/i.test(line)){ posAbs=false; continue; }
+        if(/\bG92\b/i.test(line)){
+          const mX=/X(-?\d+(?:\.\d+)?)/i.exec(line); if(mX) heads[0].x=parseFloat(mX[1]);
+          const mU=/U(-?\d+(?:\.\d+)?)/i.exec(line); if(mU) heads[1].x=parseFloat(mU[1]);
+          const mV=/V(-?\d+(?:\.\d+)?)/i.exec(line); if(mV) heads[2].x=parseFloat(mV[1]);
+          const mY=/Y(-?\d+(?:\.\d+)?)/i.exec(line); if(mY) heads.forEach(h=>h.y=parseFloat(mY[1]));
+          const mZ=/Z(-?\d+(?:\.\d+)?)/i.exec(line); if(mZ) heads.forEach(h=>h.z=parseFloat(mZ[1]));
+          continue;
+        }
+        const isMove=/\bG0?1\b/i.test(line);
+        if(isMove){
+          const isExtrude=/\bG1\b/i.test(line);
           const mX=/X(-?\d+(?:\.\d+)?)/i.exec(line);
           const mU=/U(-?\d+(?:\.\d+)?)/i.exec(line);
           const mV=/V(-?\d+(?:\.\d+)?)/i.exec(line);
           const mY=/Y(-?\d+(?:\.\d+)?)/i.exec(line);
           const mZ=/Z(-?\d+(?:\.\d+)?)/i.exec(line);
-          const mE=/E(-?\d+(?:\.\d+)?)/i.exec(line);
-          let nx=x, nu=u, nv=v, ny=y, nz=z, ne=e;
-          if(mX) nx=posAbs?parseFloat(mX[1]):x+parseFloat(mX[1]);
-          if(mU) nu=posAbs?parseFloat(mU[1]):u+parseFloat(mU[1]);
-          if(mV) nv=posAbs?parseFloat(mV[1]):v+parseFloat(mV[1]);
-          if(mY) ny=posAbs?parseFloat(mY[1]):y+parseFloat(mY[1]);
-          if(mZ) nz=posAbs?parseFloat(mZ[1]):z+parseFloat(mZ[1]);
-          if(mE){ ne=eAbs?parseFloat(mE[1]):e+parseFloat(mE[1]); anyE=true; }
-          const de=ne-e; const extrude=anyE ? (de>0) : true;
-          const segs=[]; const chY=ny!==y, chZ=nz!==z;
-          if((nx!==x)||chY||chZ) segs.push({head:0,x1:x,y1:y,z1:z,x2:nx,y2:ny,z2:nz,extrude});
-          if((nu!==u)||chY||chZ) segs.push({head:1,x1:u,y1:y,z1:z,x2:nu,y2:ny,z2:nz,extrude});
-          if((nv!==v)||chY||chZ) segs.push({head:2,x1:v,y1:y,z1:z,x2:nv,y2:ny,z2:nz,extrude});
-          if(segs.length){
-            let maxL=0;
-            for(const sg of segs){ const L=Math.hypot(sg.x2-sg.x1,sg.y2-sg.y1,sg.z2-sg.z1); sg.len=L; if(L>maxL) maxL=L; }
-            const dt=maxL/10;
-            for(const sg of segs){ sg.dt=dt; sg.t0=t; sg.t1=t+dt; delete sg.len; segments.push(sg); times.push(sg.t1); xEnd.push(nx); uEnd.push(nu); vEnd.push(nv); yEnd.push(ny); zEnd.push(nz); }
-            t+=dt;
+          let nx=[heads[0].x,heads[1].x,heads[2].x];
+          let ny=heads[0].y, nz=heads[0].z;
+          if(mX) nx[0]=posAbs?parseFloat(mX[1]):nx[0]+parseFloat(mX[1]);
+          if(mU) nx[1]=posAbs?parseFloat(mU[1]):nx[1]+parseFloat(mU[1]);
+          if(mV) nx[2]=posAbs?parseFloat(mV[1]):nx[2]+parseFloat(mV[1]);
+          if(mY) ny=posAbs?parseFloat(mY[1]):ny+parseFloat(mY[1]);
+          if(mZ) nz=posAbs?parseFloat(mZ[1]):nz+parseFloat(mZ[1]);
+
+          const segs=[]; let maxLen=0;
+          for(let i=0;i<3;i++){
+            const s={head:i,x1:heads[i].x,y1:heads[i].y,z1:heads[i].z,x2:nx[i],y2:ny,z2:nz,extrude:isExtrude};
+            if(s.x1!==s.x2||s.y1!==s.y2||s.z1!==s.z2){
+              const L=Math.hypot(s.x2-s.x1,s.y2-s.y1,s.z2-s.z1); s.len=L; segs.push(s); if(L>maxLen) maxLen=L;
+            }
           }
-          x=nx; u=nu; v=nv; y=ny; z=nz; e=ne;
+          if(segs.length){
+            const dt=maxLen/10; const t0=t, t1=t+dt;
+            for(const s of segs){ s.t0=t0; s.t1=t1; s.dt=dt; segments.push(s); }
+            const start=heads.map(h=>({...h}));
+            const end=[{x:nx[0],y:ny,z:nz},{x:nx[1],y:ny,z:nz},{x:nx[2],y:ny,z:nz}];
+            commands.push({segments:segs,start,end,t0,t1});
+            heads[0].x=nx[0]; heads[1].x=nx[1]; heads[2].x=nx[2];
+            heads.forEach(h=>{h.y=ny;h.z=nz;});
+            t=t1;
+          }
         }
       }
+      // BBox
       let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
-      for(const s of segments){ minX=Math.min(minX,s.x1,s.x2); minY=Math.min(minY,s.y1,s.y2); minZ=Math.min(minZ,s.z1,s.z2);
-                               maxX=Math.max(maxX,s.x1,s.x2); maxY=Math.max(maxY,s.y1,s.y2); maxZ=Math.max(maxZ,s.z1,s.z2); }
-      if(!isFinite(minX)){ minX=0;minY=0;minZ=0;maxX=10;maxY=10;maxZ=0; }
-      return {segments,times,totalTime:t,bbox:{minX,minY,minZ,maxX,maxY,maxZ},zMin:minZ,zMax:maxZ,xEnd,uEnd,vEnd,yEnd,zEnd};
-    }
-
-    const BIN = 64;
-
-    function setupCache(){
-      if(!parsed || !ctx) return;
-      const {bbox,zMin,zMax}=parsed;
-      const w=dims.w,h=dims.h,m=24;
-      const bx=bbox.maxX - bbox.minX, by=bbox.maxY - bbox.minY;
-      const s=Math.min((w-2*m)/(bx||1),(h-2*m)/(by||1));
-      const ox=m + (w-2*m - bx*s)/2, oy=m + (h-2*m - by*s)/2;
-      const toXY=(X,Y)=>({x:ox+(X-bbox.minX)*s, y:h-(oy+(Y-bbox.minY)*s)});
-      const bins=Array.from({length:BIN},()=>new Path2D());
-      const binLow=new Array(BIN), binHigh=new Array(BIN), binCount=new Array(BIN).fill(0);
-      for(let i=0;i<BIN;i++){ const low=zMin+i*(zMax-zMin)/BIN; binLow[i]=low; binHigh[i]=low+(zMax-zMin)/BIN; }
-      cached={bins,travels:new Path2D(),endpoints:[],zMin,zMax,bbox,ox,oy,scale:s,margin:m,toXY,binLow,binHigh,binCount};
-      for(let i=0;i<printedUntil && i<parsed.segments.length;i++){ addSegmentToCache(parsed.segments[i]); }
-    }
-
-    function addSegmentToCache(seg){
-      const a=cached.toXY(seg.x1,seg.y1), b=cached.toXY(seg.x2,seg.y2);
-      const zMid=(seg.z1+seg.z2)/2;
-      const t=(zMid - cached.zMin)/(cached.zMax - cached.zMin || 1);
-      const bi=Math.min(cached.bins.length-1,Math.max(0,Math.floor(t*cached.bins.length)));
-      if(seg.extrude){
-        cached.bins[bi].moveTo(a.x,a.y); cached.bins[bi].lineTo(b.x,b.y);
-        cached.endpoints.push({x:seg.x2,y:seg.y2,z:seg.z2,bin:bi}); cached.binCount[bi]++;
-      } else {
-        cached.travels.moveTo(a.x,a.y); cached.travels.lineTo(b.x,b.y);
+      for(const s of segments){
+        minX=Math.min(minX,s.x1,s.x2); minY=Math.min(minY,s.y1,s.y2); minZ=Math.min(minZ,s.z1,s.z2);
+        maxX=Math.max(maxX,s.x1,s.x2); maxY=Math.max(maxY,s.y1,s.y2); maxZ=Math.max(maxZ,s.z1,s.z2);
       }
+      if(!isFinite(minX)){ minX=0;minY=0;minZ=0;maxX=10;maxY=10;maxZ=1; }
+      const commandEndTimes=commands.map(c=>c.t1);
+      return {segments,commands,commandEndTimes,totalTime:t,bbox:{minX,minY,minZ,maxX,maxY,maxZ},zMin:minZ,zMax:maxZ};
     }
 
+    /* ===== Geometry cache (bins by MID-Z) ===== */
+    function rebuildCache() {
+      if (!parsed || !ctx) return;
+      const { segments, bbox, zMin, zMax } = parsed;
+      const w = dims.w, h = dims.h, m = 24;
+      const bx = bbox.maxX - bbox.minX, by = bbox.maxY - bbox.minY;
+      const s = Math.min((w - 2*m)/(bx||1), (h - 2*m)/(by||1));
+      const ox = m + (w - 2*m - bx*s)/2, oy = m + (h - 2*m - by*s)/2;
+      const toXY = (X,Y) => ({ x: ox + (X - bbox.minX)*s, y: h - (oy + (Y - bbox.minY)*s) });
+
+      const BIN = 64, bins = Array.from({length:BIN}, ()=>new Path2D());
+      const binLow = new Array(BIN), binHigh = new Array(BIN), binCount = new Array(BIN).fill(0);
+      const travels = new Path2D();
+      const endpoints = []; // extruding endpoints in world coords
+
+      for (let i=0;i<BIN;i++){ const low=zMin+i*(zMax-zMin)/BIN, high=zMin+(i+1)*(zMax-zMin)/BIN; binLow[i]=low; binHigh[i]=high; }
+
+      for (const seg of segments){
+        const a=toXY(seg.x1,seg.y1), b=toXY(seg.x2,seg.y2);
+        const zMid=(seg.z1+seg.z2)/2; const t=(zMid - zMin)/(zMax - zMin || 1);
+        const bi=Math.min(BIN-1,Math.max(0,Math.floor(t*BIN)));
+        if (seg.extrude){ bins[bi].moveTo(a.x,a.y); bins[bi].lineTo(b.x,b.y); endpoints.push({x:seg.x2,y:seg.y2,z:seg.z2,bin:bi}); binCount[bi]++; }
+        else { travels.moveTo(a.x,a.y); travels.lineTo(b.x,b.y); }
+      }
+
+      cached = { bins, travels, endpoints, zMin, zMax, bbox, ox, oy, scale:s, margin:m, toXY, binLow, binHigh, binCount };
+    }
+
+    /* ===== Sampling along the timeline ===== */
     function headsAtTime(t){
-      if(!parsed || !parsed.segments.length) return null;
-      const {segments,times,xEnd,uEnd,vEnd,yEnd,zEnd}=parsed;
+      if(!parsed || !parsed.commands.length) return null;
+      const times=parsed.commandEndTimes;
       let i=lowerBound(times,t);
-      if(i>=segments.length){
-        const idx=segments.length-1;
-        return [{x:xEnd[idx],y:yEnd[idx],z:zEnd[idx]},{x:uEnd[idx],y:yEnd[idx],z:zEnd[idx]},{x:vEnd[idx],y:yEnd[idx],z:zEnd[idx]}];
+      if(i>=parsed.commands.length) i=parsed.commands.length-1;
+      const cmd=parsed.commands[i];
+      const prevEnd=(i>0)?parsed.commands[i-1].end:cmd.start;
+      const heads=[];
+      for(let h=0;h<3;h++){
+        const seg=cmd.segments.find(s=>s.head===h);
+        if(t<cmd.t0){ heads[h]=prevEnd[h]; }
+        else if(t>=cmd.t1){ heads[h]=cmd.end[h]; }
+        else if(seg){ const u=(t-cmd.t0)/(cmd.t1-cmd.t0); heads[h]={x:seg.x1+(seg.x2-seg.x1)*u,y:seg.y1+(seg.y2-seg.y1)*u,z:seg.z1+(seg.z2-seg.z1)*u}; }
+        else heads[h]=cmd.start[h];
       }
-      const startX=i>0?xEnd[i-1]:0;
-      const startU=i>0?uEnd[i-1]:0;
-      const startV=i>0?vEnd[i-1]:0;
-      const startY=i>0?yEnd[i-1]:0;
-      const startZ=i>0?zEnd[i-1]:0;
-      let x=startX,u=startU,v=startV,y=startY,z=startZ;
-      const t0=segments[i].t0;
-      for(let j=i;j<segments.length && segments[j].t0===t0;j++){
-        const sg=segments[j];
-        const ufr=(t - t0)/sg.dt;
-        const px=sg.x1 + (sg.x2 - sg.x1)*ufr;
-        const py=sg.y1 + (sg.y2 - sg.y1)*ufr;
-        const pz=sg.z1 + (sg.z2 - sg.z1)*ufr;
-        if(sg.head===0) x=px; else if(sg.head===1) u=px; else v=px;
-        y=py; z=pz;
-      }
-      return [{x,y,z},{x:u,y,z},{x:v,y,z}];
+      return heads;
     }
-
-    function positionAtCompletion(frac){
+    function headsAtCompletion(frac){
       if(!parsed) return null;
-      const t=clamp01(frac) * (parsed.totalTime || 0);
-      const h=headsAtTime(t);
-      return h ? h[0] : null;
+      const t=clamp01(frac)*(parsed.totalTime||0);
+      return headsAtTime(t);
     }
-
-    function activeSegmentsAtTime(t){
-      if(!parsed) return [];
-      const res=[];
-      for(let i=printedUntil;i<parsed.segments.length;i++){
-        const sg=parsed.segments[i];
-        if(sg.t0<=t && t<sg.t1) res.push(sg);
-        else if(sg.t0>t) break;
-      }
-      return res;
-    }
-
-    const HEAD_COLORS=['#00f5ff','#ff5cf0','#ffe04d','#9cff66'];
 
     /* ===== Render ===== */
     function drawGrid() {
@@ -327,7 +323,7 @@
       for (let j=0;j<h;j+=40){ ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(w,j); ctx.stroke(); }
       ctx.restore();
     }
-    // const HEAD_COLORS=['#00f5ff','#ff5cf0','#ffe04d','#9cff66'];
+    const HEAD_COLORS=['#00f5ff','#ff5cf0','#ffe04d','#9cff66'];
     function drawHeadsWorld(worldHeads){
       worldHeads.forEach((h,i)=>{ const p=cached.toXY(h.x,h.y); const c=HEAD_COLORS[i%HEAD_COLORS.length];
         ctx.shadowBlur=10; ctx.shadowColor=c+'99'; ctx.fillStyle=c; ctx.beginPath(); ctx.arc(p.x,p.y,4,0,Math.PI*2); ctx.fill();
@@ -340,9 +336,9 @@
     }
 
     function draw(){
-      if (!ctx) return;
+      if(!ctx) return;
       const w=dims.w,h=dims.h; ctx.clearRect(0,0,w,h); drawGrid();
-      if (!parsed || !cached) return;
+      if(!parsed || !cached) return;
 
       const single=ui.singleLayer.checked, heat=ui.heatmap.checked, showT=ui.showTravel.checked, showH=ui.showHeads.checked, onlyPrinted=ui.onlyPrinted.checked;
 
@@ -350,70 +346,83 @@
       const zWin=parseFloat(ui.zWindow.value||'0.25'), zFrac=parseFloat(ui.zSlider.value||'0');
       let zC = zMin + (zMax - zMin) * zFrac;
 
+      // Printed boundary from loop progress
       let zPrintedHi=zC;
-      if (onlyPrinted){
-        const head = positionAtCompletion(lastCompletion||0);
-        if (head) zPrintedHi = head.z;
+      if(onlyPrinted){
+        const hs=headsAtCompletion(printedCompletion||0);
+        if(hs && hs[0]) zPrintedHi=hs[0].z;
       }
 
       const binH=(zMax-zMin)/cached.bins.length;
       let targetBin=Math.max(0,Math.min(cached.bins.length-1,Math.floor((zC - zMin)/(binH||1))));
-      if (single && onlyPrinted){
+      if(single && onlyPrinted){
         const printedBin=Math.max(0,Math.min(cached.bins.length-1,Math.floor(((zPrintedHi - zMin)/(binH||1)))));
         targetBin=Math.min(targetBin,printedBin);
         const snap=nearestPrintedBinOrBelow(targetBin);
-        if (snap>=0){ const low=cached.binLow[snap], high=cached.binHigh[snap]; zC=(low+high)/2; }
+        if(snap>=0){ const low=cached.binLow[snap], high=cached.binHigh[snap]; zC=(low+high)/2; }
       }
 
       setText('zNow', zC.toFixed(3)); setText('zSpan', `${zMin.toFixed(3)}–${zMax.toFixed(3)}`); setText('zWin', zWin.toFixed(2));
-      if (showT){ ctx.lineWidth=1.1; ctx.strokeStyle='rgba(19, 220, 255, 0.58)'; ctx.stroke(cached.travels); }
+      if(showT && printedAll){ ctx.lineWidth=1.1; ctx.strokeStyle='rgba(19, 220, 255, 0.58)'; ctx.stroke(cached.travels); }
 
       const zLo=zC - zWin/2, zHi=zC + zWin/2;
       ctx.lineWidth=2.0;
-      const drawBin=(i,color)=>{ ctx.strokeStyle=color; ctx.stroke(cached.bins[i]); };
 
-      let grad=null;
-      if(!heat){ grad=ctx.createLinearGradient(0,0,w,h); grad.addColorStop(0,'#00f5ff'); grad.addColorStop(1,'#7c4dff'); }
-
-      for (let i=0;i<cached.bins.length;i++){ const low=cached.binLow[i], high=cached.binHigh[i];
-        if (single && (high<zLo || low>zHi)) continue;
-        if (onlyPrinted && high>zPrintedHi+1e-6) continue;
-        if (heat){ const t=((low+high)/2 - zMin)/(zMax - zMin || 1); drawBin(i, hslToHex(200 + 140*t, 100, 60)); }
-        else drawBin(i, grad);
-      }
-
-      if (printedUntil < parsed.segments.length){
-        const t = loopTime;
-        const active = activeSegmentsAtTime(t);
-        for (const seg of active){
-          if (!showT && !seg.extrude) continue;
-          const low=Math.min(seg.z1,seg.z2), high=Math.max(seg.z1,seg.z2);
-          if (single && (high<zLo || low>zHi)) continue;
-          if (onlyPrinted && high>zPrintedHi+1e-6) continue;
-          const u=(t - seg.t0)/seg.dt;
-          const ax=seg.x1, ay=seg.y1, bx=seg.x1+(seg.x2-seg.x1)*u, by=seg.y1+(seg.y2-seg.y1)*u;
-          const a=cached.toXY(ax,ay), b=cached.toXY(bx,by);
-          const color = heat ? hslToHex(200 + 140*(( (seg.z1+seg.z2)/2 - zMin)/(zMax - zMin || 1)), 100, 60) : grad;
-          ctx.strokeStyle=color; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+      if(printedAll){
+        const drawBin=(i,color)=>{ ctx.strokeStyle=color; ctx.stroke(cached.bins[i]); };
+        if(heat){
+          for(let i=0;i<cached.bins.length;i++){ const low=cached.binLow[i], high=cached.binHigh[i];
+            if(single && (high<zLo||low>zHi)) continue;
+            if(onlyPrinted && high>zPrintedHi+1e-6) continue;
+            const t=((low+high)/2 - zMin)/(zMax - zMin || 1);
+            drawBin(i, hslToHex(200 + 140*t, 100, 60));
+          }
+        } else {
+          const grad=ctx.createLinearGradient(0,0,w,h); grad.addColorStop(0,'#00f5ff'); grad.addColorStop(1,'#7c4dff');
+          for(let i=0;i<cached.bins.length;i++){ const low=cached.binLow[i], high=cached.binHigh[i];
+            if(single && (high<zLo||low>zHi)) continue;
+            if(onlyPrinted && high>zPrintedHi+1e-6) continue;
+            drawBin(i, grad);
+          }
+        }
+      } else {
+        const limitT=printedCompletion*(parsed.totalTime||0);
+        for(const s of parsed.segments){
+          if(s.t0>limitT) break;
+          if(!s.extrude && !showT) continue;
+          const endT=Math.min(limitT,s.t1);
+          const u=(s.dt>0)?((endT - s.t0)/s.dt):1;
+          const zEnd=s.z1+(s.z2-s.z1)*u;
+          const zMid=(s.z1+zEnd)/2;
+          if(single && (zMid<zLo||zMid>zHi)) continue;
+          if(onlyPrinted && zEnd>zPrintedHi+1e-6) continue;
+          const a=cached.toXY(s.x1,s.y1);
+          const b=cached.toXY(s.x1+(s.x2-s.x1)*u, s.y1+(s.y2-s.y1)*u);
+          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y);
+          if(heat && s.extrude){ const tt=((zMid - zMin)/(zMax - zMin || 1)); ctx.strokeStyle=hslToHex(200 + 140*tt,100,60); }
+          else if(s.extrude) ctx.strokeStyle='#00f5ff';
+          else ctx.strokeStyle='rgba(19, 220, 255, 0.58)';
+          ctx.stroke();
         }
       }
 
-      if (showH && animHeads) drawHeadsWorld(animHeads);
-
-      const loopFrac = parsed.totalTime>0 ? (loopTime/parsed.totalTime) : 0;
-      el('overlay').textContent = `${parsed.segments.length} segments • ${(loopFrac*100).toFixed(1)}% ${single?`• Z≈${zC.toFixed(2)}mm`:''}`;
-    }
-    function animate(){
-      requestAnimationFrame(animate);
-      if (!parsed){ draw(); return; }
-      const now = performance.now()/1000;
-      const elapsed = now - animStart;
-      while (printedUntil < parsed.segments.length && parsed.segments[printedUntil].t1 <= elapsed){
-        addSegmentToCache(parsed.segments[printedUntil]); printedUntil++;
+      if(showH){
+        const hs=headsAtTime(loopCompletion*(parsed.totalTime||0));
+        if(hs) drawHeadsWorld(hs);
       }
-      loopTime = parsed.totalTime ? (elapsed % parsed.totalTime) : 0;
-      animHeads = headsAtTime(loopTime);
-      draw();
+
+      el('overlay').textContent = `${parsed.segments.length} segments • ${(loopCompletion*100||0).toFixed(1)}% ${single?`• Z≈${zC.toFixed(2)}mm`:''}`;
+
+      if(ui.followPrint.checked && cached){
+        const hs=headsAtCompletion(printedCompletion||0);
+        if(hs && hs[0]){
+          const targetFrac=(hs[0].z - cached.zMin)/(cached.zMax - cached.zMin || 1);
+          if(isFinite(targetFrac)){
+            followZ=(followZ==null)?targetFrac:(followZ*0.85 + targetFrac*0.15);
+            ui.zSlider.value=clamp01(followZ);
+          }
+        }
+      }
     }
 
     /* ===== Data / polling ===== */
@@ -421,33 +430,23 @@
 
     async function poll(){
       try{
-        const st = await getNormalizedStatus();
-        setText('state', st?.state?.status || '—'); setText('uptime', (st?.system?.uptime ?? 0)+'s');
-        lastCompletion = st?.job?.progress?.completion ?? 0; setBar(lastCompletion); setText('prog', ((lastCompletion*100)||0).toFixed(1)+'%');
+        const st=await getNormalizedStatus();
+        setText('state', st?.state?.status || '—');
+        setText('uptime', (st?.system?.uptime ?? 0)+'s');
+        serverCompletion = st?.job?.progress?.completion ?? 0;
+        setBar(serverCompletion); setText('prog', ((serverCompletion*100)||0).toFixed(1)+'%');
 
-        if (ui.followPrint.checked && cached){
-          const head = positionAtCompletion(lastCompletion||0);
-          if (head){
-            const targetFrac = (head.z - cached.zMin) / (cached.zMax - cached.zMin || 1);
-            if (isFinite(targetFrac)){
-              followZ = (followZ == null) ? targetFrac : (followZ*0.85 + targetFrac*0.15);
-              ui.zSlider.value = clamp01(followZ);
-            }
-          }
-        }
-
-        const filePath = st?.job?.file?.fileName || null; setText('job', filePath || '—');
-        if (filePath && filePath !== lastJobPath){
-          const clean = filePath.replace(/^\/+/, '').replace(/^gcodes\//,'');
-          const norm = '/gcodes/' + clean;
-          log('Job file: ' + norm + ' — fetching…');
-          const txt = await api.download(norm.replace(/^\//,''));
-          parsed = parseGcodeText(txt); lastJobPath = filePath; printedUntil = 0; animStart = performance.now()/1000; setupCache();
+        const filePath=st?.job?.file?.fileName || null; setText('job', filePath || '—');
+        const norm=filePath?normalizeJobFilePath(filePath):null;
+        if(norm && norm!==lastJobPath){
+          log('Job file: '+norm+' — fetching…');
+          const txt=await api.download(norm);
+          parsed=parseGcodeText(txt); lastJobPath=norm; rebuildCache();
+          loopStart=performance.now(); loopCompletion=0; printedCompletion=0; printedAll=false;
           log(`G-code loaded: ${parsed.segments.length} segments • heads=3 • loop ${(parsed.totalTime||0).toFixed(1)}s @ F600`);
         }
-        draw();
       } catch(e){ log('poll error: '+e.message); }
-      finally { setTimeout(poll, 1000); }
+      finally { setTimeout(poll,1000); }
     }
 
     /* ===== Upload / start ===== */
@@ -460,6 +459,22 @@
         const s = await api.start(serverFile); if (!s.ok) throw new Error('start failed '+s.status);
         log('Start command sent: ' + serverFile);
       } catch(err){ log('upload/start error: '+err.message+' (starting from Duet Web Control is also fine)'); }
+    }
+
+    function animate(){
+      if(parsed){
+        const total=parsed.totalTime||1;
+        const now=performance.now();
+        if(loopStart==null) loopStart=now;
+        const elapsed=(now-loopStart)/1000;
+        loopCompletion=(elapsed%total)/total;
+        if(!printedAll){
+          printedCompletion=Math.min(1,elapsed/total);
+          if(printedCompletion>=1) printedAll=true;
+        }
+      }
+      draw();
+      requestAnimationFrame(animate);
     }
 
     /* ===== Auto-scan (layer sweep) ===== */
@@ -477,7 +492,7 @@
       const c=el('gcodeCanvas'), r=c.parentElement.getBoundingClientRect();
       const w=Math.floor(r.width), h=Math.floor(r.height); if (w===dims.w && h===dims.h) return;
       dims={w,h}; c.width=w*devicePixelRatio; c.height=h*devicePixelRatio; c.style.width=w+'px'; c.style.height=h+'px';
-      ctx=c.getContext('2d'); ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); if(parsed) setupCache(); draw();
+      ctx=c.getContext('2d'); ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0); if(parsed) rebuildCache(); draw();
     }
     function init(){
       ui = {
